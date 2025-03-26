@@ -1,0 +1,28 @@
+{
+    "name": "Ted Talks (Alpha)",
+    "platformUrl": "https://www.ted.com/talks",
+    "description": "TED Talks are influential videos from expert speakers on education, business, science, tech and creativity, with subtitles in 100+ languages. Ideas free to stream and download.",
+    "author": "Futo",
+    "authorUrl": "https://futo.org",
+    "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
+    "scriptUrl": "./TedTalksScripts.js",
+    "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/tedtalks",
+    "version": 1,
+    "iconUrl": "./TedTalksIcon.png",
+    "id": "8d029a7f-5507-4e36-8bd8-c19a3b77d383",
+    "scriptSignature": "",
+    "scriptPublicKey": "",
+    "maxDownloadParallelism": 1,
+    "subscriptionRateLimit": 10,
+    "changelog": {
+      },
+    "packages": [
+      "Http",
+      "DOMParser"
+    ],
+    "allowUrls": [
+        ".ted.com"
+    ],
+    "settings": [
+    ]
+  }
