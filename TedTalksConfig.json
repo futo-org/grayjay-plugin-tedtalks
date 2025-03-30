@@ -1,7 +1,7 @@
 {
   "name": "Ted Talks (Alpha)",
   "platformUrl": "https://www.ted.com/talks",
-  "description": "TED Talks are influential videos from expert speakers on education, business, science, tech and creativity, with subtitles in 100+ languages. Ideas free to stream and download.",
+  "description": "TED Talks are influential videos from expert speakers on education, business, science, tech and creativity",
   "author": "Futo",
   "authorUrl": "https://futo.org",
   "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
