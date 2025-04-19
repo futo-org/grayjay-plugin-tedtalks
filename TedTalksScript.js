@@ -22,7 +22,9 @@ const REGEX = {
     TALK_URL: /^https?:\/\/(www\.)?ted\.com\/talks\/[^\/\s]+(\?.*)?$/i,
     SPEAKER_SLUG: /ted\.com\/speakers\/([a-zA-Z0-9_-]+)(?:\?|$)/,
     SPEAKER_ID: /speakerId=(\d+)/,
-    TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i
+    TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i,
+    HLS_URL: /https:\/\/.*\.m3u8/i,
+    MPEG_URL: /https:\/\/.*\.mp4/i
 };
 
 // Default request headers for TED API
@@ -68,7 +70,7 @@ source.enable = (conf, settings, saveStateStr) => {
  * @returns {ContentPager} Paged results for home page
  */
 source.getHome = () => {
-    return new TedTalksSearchPager("");
+    return new TedTalksHomePager();
 };
 
 /**
@@ -144,6 +146,68 @@ source.getContentRecommendations = (url, relatedVideos) => {
 };
 
 // ====================== CUSTOM PAGER IMPLEMENTATIONS ======================
+/**
+ * Custom pager implementation for TED Talks home page
+ */
+class TedTalksHomePager extends ContentPager {
+    /**
+     * Creates a new TED Talks home pager
+     */
+    constructor() {
+        super([], true);
+        this.cursor = "0";
+        this.hasNextPage = true;
+        this.nextPage();
+    }
+
+    /**
+     * Fetches the next page of results
+     * @returns {ContentPager} Pager with the current page results
+     */
+    nextPage() {
+        try {
+            const queryInfo = {
+                query: GQL_QUERIES.HOME_VIDEOS,
+                variables: {
+                    first: 20,
+                    after: this.cursor,
+                    isPublished: true
+                }
+            };
+
+            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
+
+            if (!response.isOk) {
+                logError(`GraphQL request failed for home videos. Status: ${response.status}`);
+                showToast(`Failed to load TED Talks. Please try again later.`);
+                return createEmptyPager();
+            }
+
+            const responseData = safeJsonParse(response.body);
+            if (!responseData?.data?.videos?.nodes) {
+                logError('Invalid response format for home videos');
+                return createEmptyPager();
+            }
+
+            // Extract video data
+            const videos = responseData.data.videos.nodes.map(video => convertToVideo(video, {}));
+
+            // Update pagination info
+            this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
+            this.cursor = responseData.data.videos.pageInfo.endCursor;
+
+            // Update results
+            this.results = videos;
+            this.hasMore = this.hasNextPage;
+
+            return this;
+        } catch (error) {
+            logError(`Exception in TedTalksHomePager.nextPage: ${error.message}`);
+            showToast(`Failed to load TED Talks: ${error.message}`);
+            return createEmptyPager();
+        }
+    }
+}
 
 /**
  * Custom pager implementation for TED Talks search results
@@ -158,6 +222,7 @@ class TedTalksSearchPager extends ContentPager {
         this.query = query;
         this.currentPage = 0;
         this.hitsPerPage = 24;
+        this.nextPage();
     }
 
     /**
@@ -184,24 +249,24 @@ class TedTalksSearchPager extends ContentPager {
             if (!response.isOk) {
                 logError(`Search API request failed. Status: ${response.status}, Query: "${this.query}", Page: ${this.currentPage}`);
                 showToast(`Failed to load TED Talks. Please try again later.`);
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             const searchResults = safeJsonParse(response.body)?.results?.[0];
             if (!searchResults?.hits) {
                 logError(`Invalid search response format for query: "${this.query}", Page: ${this.currentPage}`);
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             const hits = searchResults.hits;
             if (hits.length === 0) {
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             // Get additional metadata for the videos
             const slugs = hits.map(hit => hit.slug).filter(Boolean);
-            const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
 
+            const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
             // Convert hits to videos
             const videos = hits.map(hit => convertToVideo(hit, extraMetadata[hit.slug] || {}));
 
@@ -220,9 +285,9 @@ class TedTalksSearchPager extends ContentPager {
             // Return self
             return this;
         } catch (error) {
-            logError(`Exception in TedTalksSearchPager.nextPage: ${error.message}, Query: "${this.query}", Page: ${this.currentPage}`);
+            logError(`Exception in TedTalksSearchPager.nextPage: ${error.message}`);
             showToast(`Failed to load TED Talks: ${error.message}`);
-            return new ContentPager([], false);
+            return createEmptyPager();
         }
     }
 }
@@ -290,18 +355,18 @@ function getVideoRecommendations(url, relatedVideos) {
         // If related videos aren't provided, fetch them
         if (!relatedVideos) {
             const responseBody = makeGraphQLRequest(
-                'VIDEO_DETAILS',
+                'RELATED',
                 { slug: slug, language: "en" },
-                "shareLinks"
+                "related"
             );
-
+            
             if (!responseBody?.data?.videos?.nodes || responseBody.data.videos.nodes.length === 0) {
                 logError(`No video data found for slug: ${slug}`);
                 return createEmptyPager();
             }
-
-            const video = responseBody.data.videos.nodes[0];
-            relatedVideos = video.relatedVideos || [];
+            
+            relatedVideos = responseBody?.data?.videos?.nodes?.[0]?.relatedVideos ?? [];
+            
         }
 
         if (!relatedVideos?.length) {
@@ -497,7 +562,6 @@ function getVideoDetailsByUrl(url) {
         }
 
         const video = responseBody.data.videos.nodes[0];
-        const sources = createVideoSources(video);
         const speaker = video.speakers?.nodes?.[0];
         const thumbnailUrl = extractThumbnailUrl(video);
 
@@ -508,7 +572,7 @@ function getVideoDetailsByUrl(url) {
             datetime: dateToUnixSeconds(video.publishedAt),
             description: video.description || '',
             url: url,
-            video: new VideoSourceDescriptor(sources),
+            video: createVideoSources(video),
             duration: safeParseInt(video.duration),
             thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
             viewCount: video.viewedCount || 0,
@@ -652,6 +716,30 @@ function makeRequestWithRetry(method, url, body, headers) {
 
 // ====================== CONVERSION FUNCTIONS ======================
 
+function mapSource(source, key, duration) {
+    let sources = [];
+    if (REGEX.HLS_URL.test(source.stream)) {
+        sources.push(
+            new HLSSource({
+                name: key,
+                url: source.stream,
+                duration: duration,
+                priority: true,
+            }),
+        );
+    } else if (REGEX.MPEG_URL.test(source.file)) {
+        sources.push(
+            new VideoUrlSource({
+                name: key,
+                duration: duration,
+                url: source.file,
+                container: "video/mp4"
+            }),
+        );
+    }
+
+    return sources;
+}
 /**
  * Converts TED Talk video data to platform-specific video format
  * @param {Object} videoData TED Talk video data
@@ -667,6 +755,7 @@ function convertToVideo(videoData, extraData) {
 
         const viewedCount = videoData?.viewedCount || extraData?.viewedCount || 0;
         const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
+        const duration = safeParseInt(videoData.duration);
 
         // Create author link
         const author = createAuthorLink({
@@ -676,21 +765,29 @@ function convertToVideo(videoData, extraData) {
             slug: speaker.slug,
             photoUrl: speaker.photoUrl
         });
-
         // Extract thumbnails
         const thumbnails = extractThumbnails(videoData, extraData);
 
-        return new PlatformVideo({
+
+        const details = new PlatformVideoDetails({
             id: new PlatformID(PLATFORM.NAME, videoData.slug || 'unknown', config.id),
             name: videoData.title || 'Unknown TED Talk',
             thumbnails: new Thumbnails(thumbnails),
-            duration: safeParseInt(videoData.duration),
+            description: videoData.description || '',
+            duration: duration,
             viewCount: viewedCount,
             url: videoUrl,
             uploadDate: dateToUnixSeconds(publishedAt),
             shareUrl: videoUrl,
-            author: author
+            author: author,
+            video: createVideoSources(videoData)
         });
+
+        details.getContentRecommendations = () => {
+            return source.getContentRecommendations(videoUrl, videoData.relatedVideos);
+        };
+
+        return details;
     } catch (error) {
         logError(`Exception in convertToVideo: ${error.message}`);
 
@@ -703,18 +800,36 @@ function convertToVideo(videoData, extraData) {
  * Extracts speaker information from video data
  * @param {Object} videoData Video data
  * @param {Object} extraData Additional metadata
- * @returns {Object} Speaker information
+ * @returns {Object} Speaker information with firstname, lastname, slug, id, and photoUrl
  */
 function extractSpeakerInfo(videoData, extraData) {
-    const speaker = {};
 
-    speaker.firstname = videoData?.speakers?.[0]?.firstname || extraData?.speaker?.firstname || '';
-    speaker.lastname = videoData?.speakers?.[0]?.lastname || extraData?.speaker?.lastname || '';
-    speaker.slug = videoData?.speakers?.[0]?.slug || extraData?.speaker?.slug || '';
-    speaker.id = videoData?.speakers?.[0]?.id || extraData?.speaker?.id || '';
-    speaker.photoUrl = videoData?.speakers?.[0]?.photoUrl || extraData?.speaker?.photoUrl || PLATFORM.FALLBACK_AVATAR;
-
-    return speaker;
+    // Find the first available speaker source
+    const speakerSource = [
+        videoData.speakers?.nodes?.[0],
+        videoData.speakers?.[0],
+        extraData?.speaker
+    ].find(source => source);
+    
+    // If a speaker source was found, extract information from it
+    if (speakerSource) {
+        return {
+            firstname: speakerSource.firstname || '',
+            lastname: speakerSource.lastname || '',
+            slug: speakerSource.slug || '',
+            id: speakerSource.id || '',
+            photoUrl: speakerSource.photoUrl || PLATFORM.FALLBACK_AVATAR
+        };
+    }
+    
+    // Return a default speaker object if no information was found
+    return {
+        firstname: 'Unknown Speaker',
+        lastname: '',
+        slug: '',
+        id: '',
+        photoUrl: PLATFORM.FALLBACK_AVATAR
+    };
 }
 
 /**
@@ -787,48 +902,30 @@ function createAuthorLink(speaker) {
  * @returns {Array} Array of video source objects
  */
 function createVideoSources(video) {
-    try {
-        const sources = [];
-        const duration = safeParseInt(video.duration);
+    const videoSources = [];
+    const audioSources = [];
+    
+    const duration = safeParseInt(video.duration);
 
-        // Add HLS source if available
-        if (video.hlsUrl) {
-            sources.push(
-                new HLSSource({
-                    name: 'HLS',
-                    url: video.hlsUrl,
-                    duration: duration,
-                    priority: true
-                })
-            );
-        }
-
-        // Add MP4 sources for different qualities
-        if (video.nativeDownloads) {
-            addMp4Sources(sources, video.nativeDownloads, duration);
-        }
-
-        return sources;
-    } catch (error) {
-        logError(`Exception in createVideoSources: ${error.message}`);
-        return [];
+    // Add HLS source if available
+    if (video.hlsUrl) {
+        videoSources.push(
+            new HLSSource({
+                name: 'HLS',
+                url: video.hlsUrl,
+                duration: duration,
+                priority: true
+            })
+        );
     }
-}
 
-/**
- * Adds MP4 video sources to the sources array
- * @param {Array} sources Array to add sources to
- * @param {Object} downloads Download URLs for different qualities
- * @param {number} duration Video duration
- */
-function addMp4Sources(sources, downloads, duration) {
-    // Low quality
-    if (downloads.low) {
-        sources.push(
+    // Add MP4 sources for different qualities
+    if (video?.nativeDownloads?.low) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.LOW.name,
                 duration: duration,
-                url: downloads.low,
+                url: video?.nativeDownloads?.low,
                 width: VIDEO_QUALITY.LOW.width,
                 height: VIDEO_QUALITY.LOW.height,
                 container: "video/mp4"
@@ -837,12 +934,12 @@ function addMp4Sources(sources, downloads, duration) {
     }
 
     // Medium quality
-    if (downloads.medium) {
-        sources.push(
+    if (video?.nativeDownloads?.medium) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.MEDIUM.name,
                 duration: duration,
-                url: downloads.medium,
+                url: video?.nativeDownloads?.medium,
                 width: VIDEO_QUALITY.MEDIUM.width,
                 height: VIDEO_QUALITY.MEDIUM.height,
                 container: "video/mp4"
@@ -851,18 +948,55 @@ function addMp4Sources(sources, downloads, duration) {
     }
 
     // High quality
-    if (downloads.high) {
-        sources.push(
+    if (video?.nativeDownloads?.high) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.HIGH.name,
                 duration: duration,
-                url: downloads.high,
+                url: video?.nativeDownloads?.medium,
                 width: VIDEO_QUALITY.HIGH.width,
                 height: VIDEO_QUALITY.HIGH.height,
                 container: "video/mp4"
             })
         );
     }
+
+    const playerData = video?.playerData;
+
+    if (!videoSources.length && playerData) {
+
+        try {
+            const playerData = safeJsonParse(playerData);
+            if (playerData?.resources) {
+                for (let key in playerData.resources) {
+                    const sourceType = playerData.resources[key];
+                    if (Array.isArray(sourceType)) {
+                        sourceType.forEach(source => {
+                            videoSources.push(...mapSource(source, key, duration));
+                        });
+                    } else {
+                        videoSources.push(...mapSource(sourceType, key, duration));
+                    }
+                }
+            }
+        } catch (playerDataError) {
+            logError(`Error processing playerData: ${playerDataError.message}`);
+        }
+    }
+
+    // Audio source has diferent duration, and includes some narration in the beginning. Could be used in an audio only mode
+    // if(video.audioDownload){
+    //     audioSources.push(
+    //         new AudioUrlSource({
+    //             name: "audio/mp3",
+    //             duration: duration,
+    //             url: video.audioDownload,
+    //             container: "audio/mp3"
+    //         })
+    //     );
+    // }
+
+    return new UnMuxVideoSourceDescriptor(videoSources, audioSources);
 }
 
 // ====================== UTILITY FUNCTIONS ======================
@@ -1084,7 +1218,48 @@ function showToast(message) {
 }
 
 // ====================== GRAPHQL QUERIES ======================
+
 const GQL_QUERIES = {
+    HOME_VIDEOS: `
+query Videos($first: Int, $after: String) {
+	videos(first: $first, after: $after) {
+		nodes {
+			nativeDownloads {
+				high
+				low
+				medium
+			}
+            canonicalUrl
+			audioDownload
+			playerData
+			duration
+			description
+			hlsUrl
+			slug
+			id
+			language
+			publishedAt
+			title
+			viewedCount
+			speakers {
+				nodes {
+					id
+					firstname
+					lastname
+					slug
+					photoUrl
+				}
+			}
+		}
+		pageInfo {
+			endCursor
+			hasNextPage
+			startCursor
+		}
+	}
+}
+
+`,
     VIDEO_DETAILS: `
     query shareLinks($slug: String!, $language: String) {
         videos(
@@ -1098,10 +1273,8 @@ const GQL_QUERIES = {
                 id
                 viewedCount
                 playerData
-                hasTranslations
                 publishedAt
                 hlsUrl
-                fallbackUrl
                 canonicalUrl
                 audioDownload
                 title
@@ -1135,12 +1308,6 @@ const GQL_QUERIES = {
                     low
                     medium
                     high
-                }
-                subtitledDownloads {
-                    low
-                    high
-                    internalLanguageCode
-                    languageName
                 }
             }
         }
@@ -1187,5 +1354,48 @@ const GQL_QUERIES = {
             whoTheyAre
         }
     }
+    `,
+    RELATED: `
+    query related($slug: String!, $language: String) {
+	videos(
+		slug: [$slug]
+		language: $language
+		first: 1
+		isPublished: [true]
+		channel: ALL
+	) {
+		nodes {
+			relatedVideos {
+				title
+				slug
+				id
+				duration
+				hlsUrl
+                canonicalUrl
+				videoDownloads {
+					nodes {
+						url
+					}
+				}
+				viewedCount
+				publishedAt
+				recordedOn
+				speakers {
+					nodes {
+						id
+						firstname
+						lastname
+						slug
+						photoUrl
+					}
+				}
+			}
+		}
+	}
+}
+
+
     `
 };
+
+log('LOADED');
