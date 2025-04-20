@@ -1276,7 +1276,6 @@ query Videos($first: Int, $after: String) {
                 publishedAt
                 hlsUrl
                 canonicalUrl
-                audioDownload
                 title
                 description
                 relatedVideos {
@@ -1320,6 +1319,9 @@ query Videos($first: Int, $after: String) {
                 id
                 title
                 slug
+                hlsUrl
+                description
+                canonicalUrl
                 viewedCount
                 publishedAt
                 duration
@@ -1332,6 +1334,11 @@ query Videos($first: Int, $after: String) {
                         slug
                         photoUrl
                     }
+                }
+                nativeDownloads {
+                    low
+                    medium
+                    high
                 }
             }
             totalCount
