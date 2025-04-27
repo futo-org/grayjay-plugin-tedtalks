@@ -7,14 +7,18 @@
   "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
   "scriptUrl": "./TedTalksScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/tedtalks",
-  "version": 1,
+  "version": 2,
   "iconUrl": "./TedTalksIcon.png",
   "id": "8d029a7f-5507-4e36-8bd8-c19a3b77d383",
   "scriptSignature": "",
   "scriptPublicKey": "",
   "maxDownloadParallelism": 1,
   "subscriptionRateLimit": 10,
-  "changelog": {},
+  "changelog": {
+    "2": [
+      "improvement: improve performance opening videos;"
+    ]
+  },
   "packages": [
     "Http",
     "DOMParser"

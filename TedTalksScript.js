@@ -1283,6 +1283,16 @@ query Videos($first: Int, $after: String) {
                     slug
                     id
                     duration
+                    hlsUrl
+                    canonicalUrl
+                    videoDownloads {
+                        nodes {
+                            url
+                        }
+                    }
+                    viewedCount
+                    publishedAt
+                    recordedOn
                     speakers {
                         nodes {
                             id
