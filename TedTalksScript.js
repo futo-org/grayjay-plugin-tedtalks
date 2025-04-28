@@ -175,7 +175,7 @@ class TedTalksHomePager extends ContentPager {
                 }
             };
 
-            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
+            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
 
             if (!response.isOk) {
                 logError(`GraphQL request failed for home videos. Status: ${response.status}`);
@@ -244,7 +244,7 @@ class TedTalksSearchPager extends ContentPager {
             };
 
             const request = [{ "indexName": "newest", "params": searchParams }];
-            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS);
+            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS, { parseResponse: true });
 
             if (!response.isOk) {
                 logError(`Search API request failed. Status: ${response.status}, Query: "${this.query}", Page: ${this.currentPage}`);
@@ -301,7 +301,7 @@ class TedTalksSearchPager extends ContentPager {
  */
 function searchSpeakers(query) {
     const url = `${PLATFORM.SPEAKER_URL}?sort=first&q=${encodeURIComponent(query)}`;
-    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { parseResponse: true });
 
     if (!response.isOk) {
         logError(`Failed to get speakers search page. Status: ${response.status}, URL: ${url}`);
@@ -612,7 +612,7 @@ function makeGraphQLRequest(queryName, variables, operationName) {
             variables: variables
         };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
 
         if (!response.isOk) {
             logError(`GraphQL request failed. Query: ${queryName}, Status: ${response.status}`);
@@ -664,54 +664,112 @@ function getVideoDetailsBySlugList(slugs) {
 }
 
 /**
- * Makes an HTTP request with a single retry on failure
- * @param {string} method HTTP method ('GET' or 'POST')
- * @param {string} url URL to request
- * @param {Object|string} body Request body (for POST)
- * @param {Object} headers HTTP headers
- * @returns {Object} HTTP response
+ * Makes an HTTP request with automatic retries and error handling
+ * 
+ * @param {string} method - HTTP method ('GET', 'POST', etc.)
+ * @param {string} url - The URL to make the request to
+ * @param {string|Object|null} body - Request body for POST/PUT requests
+ * @param {Object} headers - HTTP headers for the request
+ * @param {Object} options - Additional options
+ * @param {boolean} [options.useAuth=false] - Whether to use authentication for the request
+ * @param {boolean} [options.parseResponse=false] - Whether to parse the response as JSON
+ * @param {number} [options.maxRetries=3] - Maximum number of retry attempts
+ * @param {boolean} [options.throwOnError=false] - Whether to throw an exception on error
+ * @returns {Object} - Response object with isOk, code, and body properties
  */
-function makeRequestWithRetry(method, url, body, headers) {
-    try {
-        let response;
-        if (method === 'GET') {
-            response = http.GET(url, headers);
-        } else if (method === 'POST') {
-            response = http.POST(url, body, headers);
-        } else {
-            throw new Error(`Unsupported HTTP method: ${method}`);
-        }
+function makeRequestWithRetry(method, url, body = null, headers = {}, options = {}) {
+    const {
+        useAuth = false,
+        parseResponse = false,
+        maxRetries = 4,
+        throwOnError = true
+    } = options;
+    
+    let remainingAttempts = maxRetries + 1; // +1 for the initial attempt
+    let lastResponse = null;
+    let lastError = null;
+    
+    while (remainingAttempts > 0) {
 
-        // If the request was successful, return the response
-        if (response.isOk) {
-            return response;
-        }
-
-        // If the request failed, log the error and retry once
-        logError(`HTTP ${method} request to ${url} failed with status ${response.status}. Retrying...`);
-
-        // Retry the request immediately
-        if (method === 'GET') {
-            return http.GET(url, headers);
-        } else {
-            return http.POST(url, body, headers);
-        }
-    } catch (error) {
-        logError(`Exception in makeRequestWithRetry: ${error.message}`);
-
-        // Retry the request
         try {
-            if (method === 'GET') {
-                return http.GET(url, headers);
+            let response;
+            
+            // Make the appropriate type of request based on method
+            if (method.toUpperCase() === 'GET') {
+                // using object spread due to issue on desktop when modifying the object with response.parsedBody
+                response = {...http.GET(url, headers, useAuth)};
+            } else if (method.toUpperCase() === 'POST') {
+                // using object spread due to issue on desktop when modifying the object with response.parsedBody
+                response = {...http.POST(url, body, headers, useAuth)};
             } else {
-                return http.POST(url, body, headers);
+                throw new ScriptException(`Unsupported HTTP method: ${method}`);
             }
-        } catch (retryError) {
-            logError(`Retry also failed: ${retryError.message}`);
-            // Return a dummy response to avoid crashes
-            return { isOk: false, status: 0, body: "{}" };
+            
+            // If request was successful, optionally parse the response
+            if (response.isOk && parseResponse) {
+                try {
+                    
+                    response.parsedBody = JSON.parse(response.body);
+                    
+                    // Check for API error responses that might be in a 200 response
+                    if (response.parsedBody.errors) {
+                        const errorMsg = `API returned error: ${JSON.stringify(response.parsedBody.errors)}`;
+                        logError(errorMsg);
+                        if (throwOnError) {
+                            throw new ScriptException(errorMsg);
+                        }
+                    }
+                } catch (parseError) {
+                    
+                    const errorMsg = `Failed to parse response as JSON: ${parseError.message}`;
+                    logError(errorMsg);
+                    if (throwOnError) {
+                        throw new ScriptException(errorMsg);
+                    }
+                }
+            }
+            
+            // Return on success
+            if (response.isOk) {
+                return response;
+            }
+            
+            // Save the failed response and log the error
+            lastResponse = response;
+            const errorMsg = `${method} request to ${url} failed with status ${response.code}`;
+            logError(`${errorMsg}. Attempts left: ${remainingAttempts - 1}`);
+            
+            if (throwOnError) {
+                throw new ScriptException(errorMsg);
+            }
+            
+            remainingAttempts--;
+            
+        } catch (error) {
+            // Save the error and log it
+            lastError = error;
+            logError(`Exception in ${method} request to ${url}: ${error.message}. Attempts left: ${remainingAttempts - 1}`);
+            
+            if (throwOnError && remainingAttempts <= 1) {
+                throw error;
+            }
+            
+            remainingAttempts--;
         }
     }
+    
+    // All retry attempts have failed, return last response or construct a dummy response
+    if (lastResponse) {
+        return lastResponse;
+    }
+    
+    // Create a dummy response if we don't have a real one
+    return { 
+        isOk: false, 
+        code: 0,
+        status: 0,
+        body: JSON.stringify({ error: lastError ? lastError.message : `${method} request failed after all retry attempts` }) 
+    };
 }
 
 // ====================== CONVERSION FUNCTIONS ======================
@@ -1407,8 +1465,6 @@ query Videos($first: Int, $after: String) {
 		}
 	}
 }
-
-
     `
 };
 
