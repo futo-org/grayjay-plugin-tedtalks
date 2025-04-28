@@ -190,7 +190,7 @@ class TedTalksHomePager extends ContentPager {
             }
 
             // Extract video data
-            const videos = responseData.data.videos.nodes.map(video => convertToVideo(video, {}));
+            const videos = responseData.data.videos.nodes.map(video => convertToPlatformVideoDetails(video, {}));
 
             // Update pagination info
             this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
@@ -268,7 +268,7 @@ class TedTalksSearchPager extends ContentPager {
 
             const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
             // Convert hits to videos
-            const videos = hits.map(hit => convertToVideo(hit, extraMetadata[hit.slug] || {}));
+            const videos = hits.map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
 
             // Calculate if there are more pages
             const totalHits = searchResults.nbHits || 0;
@@ -353,7 +353,7 @@ function getVideoRecommendations(url, relatedVideos) {
         }
 
         // If related videos aren't provided, fetch them
-        if (!relatedVideos) {
+        if (!relatedVideos || !relatedVideos.length) {
             const responseBody = makeGraphQLRequest(
                 'RELATED',
                 { slug: slug, language: "en" },
@@ -379,7 +379,7 @@ function getVideoRecommendations(url, relatedVideos) {
 
         // Convert related videos to platform videos
         const videos = relatedVideos.map(relatedVideo => {
-            return convertToVideo(relatedVideo, metaSet[relatedVideo.slug])
+            return convertToPlatformVideoDetails(relatedVideo, metaSet[relatedVideo.slug])
         });
 
         return new ContentPager(videos, false);
@@ -431,7 +431,7 @@ function getChannelContentsByUrl(url) {
                 if (video?.speakers) {
                     video.speakers = video.speakers.filter(s => s.slug === channelSlug);
                 }
-                return convertToVideo(video, {});
+                return convertToPlatformVideoDetails(video, {});
             });
 
         return new ContentPager(videos, false);
@@ -578,9 +578,11 @@ function getVideoDetailsByUrl(url) {
             viewCount: video.viewedCount || 0,
         });
 
+        const relatedVideos = Array.isArray(video?.relatedVideos) ? video.relatedVideos : [];
+
         // Add method to get recommendations without refetching video data
         details.getContentRecommendations = () => {
-            return source.getContentRecommendations(url, video.relatedVideos);
+            return source.getContentRecommendations(url, relatedVideos);
         };
 
         return details;
@@ -800,57 +802,70 @@ function mapSource(source, key, duration) {
 /**
  * Converts TED Talk video data to platform-specific video format
  * @param {Object} videoData TED Talk video data
- * @param {Object} extraData Extra metadata for the video
+ * @param {Object} [extraData] Extra metadata for the video
  * @returns {PlatformVideo} Formatted platform video object
+ * @throws {ScriptException} If videoData is invalid or missing required properties
  */
-function convertToVideo(videoData, extraData) {
-    try {
-        const videoUrl = `${PLATFORM.TALKS_URL}/${videoData.slug || ''}`;
+function convertToPlatformVideoDetails(videoData, extraData) {
 
-        // Get speaker information, with fallbacks
-        const speaker = extractSpeakerInfo(videoData, extraData);
-
-        const viewedCount = videoData?.viewedCount || extraData?.viewedCount || 0;
-        const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
-        const duration = safeParseInt(videoData.duration);
-
-        // Create author link
-        const author = createAuthorLink({
-            id: speaker.id,
-            firstname: speaker.firstname,
-            lastname: speaker.lastname,
-            slug: speaker.slug,
-            photoUrl: speaker.photoUrl
-        });
-        // Extract thumbnails
-        const thumbnails = extractThumbnails(videoData, extraData);
-
-
-        const details = new PlatformVideoDetails({
-            id: new PlatformID(PLATFORM.NAME, videoData.slug || 'unknown', config.id),
-            name: videoData.title || 'Unknown TED Talk',
-            thumbnails: new Thumbnails(thumbnails),
-            description: videoData.description || '',
-            duration: duration,
-            viewCount: viewedCount,
-            url: videoUrl,
-            uploadDate: dateToUnixSeconds(publishedAt),
-            shareUrl: videoUrl,
-            author: author,
-            video: createVideoSources(videoData)
-        });
-
-        details.getContentRecommendations = () => {
-            return source.getContentRecommendations(videoUrl, videoData.relatedVideos);
-        };
-
-        return details;
-    } catch (error) {
-        logError(`Exception in convertToVideo: ${error.message}`);
-
-        // Return a minimal valid video object with available data
-        return createFallbackVideo(videoData);
+    if (!videoData || typeof videoData !== 'object') {
+        throw new ScriptException('Invalid videoData: Expected an object');
     }
+    
+    // Ensure extraData is an object if provided
+    extraData = extraData && typeof extraData === 'object' ? extraData : {};
+    
+    // Get the video slug with validation
+    const slug = videoData.slug || '';
+    if (!slug) {
+        log('Video slug is missing or empty');
+    }
+    
+    const videoUrl = `${PLATFORM.TALKS_URL}/${slug}`;
+    
+    // Get speaker information, with fallbacks
+    const speaker = extractSpeakerInfo(videoData, extraData);
+
+    const viewedCount = videoData?.viewedCount || extraData?.viewedCount || 0;
+    const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
+    const duration = safeParseInt(videoData.duration);
+
+    // Create author link
+    const author = createAuthorLink({
+        id: speaker.id,
+        firstname: speaker.firstname,
+        lastname: speaker.lastname,
+        slug: speaker.slug,
+        photoUrl: speaker.photoUrl
+    });
+    
+    // Extract thumbnails
+    const thumbnails = extractThumbnails(videoData, extraData) || [];
+    if (!thumbnails || !thumbnails.length) {
+       log('No thumbnails found for video');
+    }
+    
+    const details = new PlatformVideoDetails({
+        id: new PlatformID(PLATFORM.NAME, slug || 'unknown', config.id),
+        name: videoData.title || 'Unknown TED Talk',
+        thumbnails: new Thumbnails(thumbnails),
+        description: videoData.description || '',
+        duration: duration,
+        viewCount: viewedCount,
+        url: videoUrl,
+        uploadDate: dateToUnixSeconds(publishedAt),
+        shareUrl: videoUrl,
+        author: author,
+        video: createVideoSources(videoData)
+    });
+
+    const relatedVideos = Array.isArray(videoData?.relatedVideos) ? videoData.relatedVideos : [];
+    
+    details.getContentRecommendations = () => {
+        return source.getContentRecommendations(videoUrl, relatedVideos);
+    };
+
+    return details;
 }
 
 /**
@@ -912,26 +927,6 @@ function extractThumbnails(videoData, extraData) {
     return thumbnails;
 }
 
-/**
- * Creates a fallback video object with minimal data
- * @param {Object} videoData Basic video data
- * @returns {PlatformVideo} Minimal video object
- */
-function createFallbackVideo(videoData) {
-    return new PlatformVideo({
-        id: new PlatformID(PLATFORM.NAME, videoData.slug || "unknown", config.id),
-        name: videoData.title || "Unknown TED Talk",
-        thumbnails: new Thumbnails([]),
-        duration: 0,
-        url: `${PLATFORM.TALKS_URL}/${videoData.slug || ""}`,
-        author: new PlatformAuthorLink(
-            new PlatformID(PLATFORM.NAME, "unknown", config.id),
-            "Unknown Speaker",
-            "",
-            PLATFORM.FALLBACK_AVATAR
-        )
-    });
-}
 
 /**
  * Creates a PlatformAuthorLink for a speaker
@@ -1080,6 +1075,7 @@ function safeParseInt(value) {
         const parsed = parseInt(value);
         return isNaN(parsed) ? 0 : parsed;
     } catch (error) {
+        logError(`Integer parse error: ${error.message}`);
         return 0;
     }
 }
