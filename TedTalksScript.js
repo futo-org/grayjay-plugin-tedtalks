@@ -723,8 +723,7 @@ function mapSource(source, key, duration) {
             new HLSSource({
                 name: key,
                 url: source.stream,
-                duration: duration,
-                priority: true,
+                duration: duration
             }),
         );
     } else if (REGEX.MPEG_URL.test(source.file)) {
@@ -903,7 +902,6 @@ function createAuthorLink(speaker) {
  */
 function createVideoSources(video) {
     const videoSources = [];
-    const audioSources = [];
     
     const duration = safeParseInt(video.duration);
 
@@ -913,8 +911,7 @@ function createVideoSources(video) {
             new HLSSource({
                 name: 'HLS',
                 url: video.hlsUrl,
-                duration: duration,
-                priority: true
+                duration: duration
             })
         );
     }
@@ -996,7 +993,7 @@ function createVideoSources(video) {
     //     );
     // }
 
-    return new UnMuxVideoSourceDescriptor(videoSources, audioSources);
+    return new VideoSourceDescriptor(videoSources);
 }
 
 // ====================== UTILITY FUNCTIONS ======================
