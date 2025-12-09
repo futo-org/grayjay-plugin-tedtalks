@@ -599,11 +599,14 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
-        // Fetch the speaker page
-        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+        // Construct clean speaker URL without query parameters (some URLs have ?speakerId= which returns 404)
+        const cleanUrl = `${PLATFORM.BASE_URL}/speakers/${channelSlug}`;
+
+        // Fetch the speaker page (don't throw on error, handle gracefully)
+        const response = makeRequestWithRetry('GET', cleanUrl, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
         if (!response.isOk) {
-            logError(`Failed to get channel page. Status: ${response.status}, URL: ${url}`);
-            showToast('Failed to load speaker page or speaker does not have a profile yet.');
+            logError(`Failed to get channel page. Status: ${response.status}, URL: ${cleanUrl}`);
+            showToast('Speaker does not have a profile page yet.');
             return createEmptyPager();
         }
 
