@@ -13,6 +13,7 @@ const PLATFORM = {
     GRAPHQL_URL: 'https://www.ted.com/graphql',
     SEARCH_URL: 'https://zenith-prod-alt.ted.com/api/search',
     SPEAKER_URL: 'https://www.ted.com/speakers',
+    PLAYLIST_URL: 'https://www.ted.com/playlists',
     FALLBACK_AVATAR: 'https://plugins.grayjay.app/TedTalks/media/speaker.png'
 };
 
@@ -20,6 +21,8 @@ const PLATFORM = {
 const REGEX = {
     SPEAKER_URL: /^https?:\/\/(www\.)?ted\.com\/speakers\/[^\/\s]+(\?.*)?$/i,
     TALK_URL: /^https?:\/\/(www\.)?ted\.com\/talks\/[^\/\s]+(\?.*)?$/i,
+    PLAYLIST_URL: /^https?:\/\/(www\.)?ted\.com\/playlists\/\d+(\/[a-zA-Z0-9_-]+)?$/i,
+    PLAYLIST_ID_SLUG: /ted\.com\/playlists\/(\d+)(?:\/([a-zA-Z0-9_-]+))?/i,
     SPEAKER_SLUG: /ted\.com\/speakers\/([a-zA-Z0-9_-]+)(?:\?|$)/,
     SPEAKER_ID: /speakerId=(\d+)/,
     TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i,
@@ -148,6 +151,24 @@ source.getContentDetails = (url) => {
  */
 source.getContentRecommendations = (url, relatedVideos) => {
     return getVideoRecommendations(url, relatedVideos);
+};
+
+/**
+ * Check if a URL is a TED playlist
+ * @param {string} url URL to check
+ * @returns {boolean} True if the URL is a TED playlist
+ */
+source.isPlaylistUrl = (url) => {
+    return urlMatches(url, REGEX.PLAYLIST_URL);
+};
+
+/**
+ * Get playlist details from a TED playlist URL
+ * @param {string} url Playlist URL
+ * @returns {PlatformPlaylistDetails} Playlist details
+ */
+source.getPlaylist = (url) => {
+    return getPlaylistByUrl(url);
 };
 
 // ====================== CUSTOM PAGER IMPLEMENTATIONS ======================
@@ -391,6 +412,169 @@ function getVideoRecommendations(url, relatedVideos) {
     } catch (error) {
         logError(`Exception in getVideoRecommendations: ${error.message}`);
         return createEmptyPager();
+    }
+}
+
+/**
+ * Gets playlist details from a TED playlist URL
+ * @param {string} url Playlist URL
+ * @returns {PlatformPlaylistDetails} Playlist details
+ */
+function getPlaylistByUrl(url) {
+    try {
+        const { id, slug } = extractPlaylistIdAndSlug(url);
+        if (!id) {
+            logError(`Could not extract playlist ID from URL: ${url}`);
+            showToast('Could not determine playlist from URL.');
+            return null;
+        }
+
+        // Fetch the playlist page to get data from __NEXT_DATA__
+        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+        if (!response.isOk) {
+            logError(`Failed to get playlist page. Status: ${response.status}, URL: ${url}`);
+            showToast('Failed to load playlist.');
+            return null;
+        }
+
+        // Extract playlist data from __NEXT_DATA__
+        const playlistData = extractNextDataFromHtml(response.body, 'playlist');
+        if (!playlistData) {
+            logError(`Could not extract playlist data from page: ${url}`);
+            showToast('Failed to parse playlist data.');
+            return null;
+        }
+
+        // Get thumbnail from primaryImageSet
+        const thumbnailUrl = playlistData.primaryImageSet?.[0]?.url || '';
+
+        // Get video count
+        const videoCount = playlistData.videos?.totalCount || playlistData.videos?.nodes?.length || 0;
+
+        // Get video slugs for fetching full metadata
+        const videoSlugs = (playlistData.videos?.nodes || []).map(v => v.slug).filter(Boolean);
+        const extraMetadata = videoSlugs.length > 0 ? getVideoDetailsBySlugList(videoSlugs) : {};
+
+        // Convert playlist videos to platform videos
+        const videos = (playlistData.videos?.nodes || []).map(video => {
+            return convertPlaylistVideoToPlatformVideo(video, extraMetadata[video.slug] || {});
+        });
+
+        return new PlatformPlaylistDetails({
+            id: new PlatformID(PLATFORM.NAME, playlistData.id || id, config.id),
+            name: playlistData.title || 'TED Playlist',
+            thumbnail: thumbnailUrl,
+            author: new PlatformAuthorLink(
+                new PlatformID(PLATFORM.NAME, 'TED', config.id),
+                playlistData.author || 'TED',
+                PLATFORM.BASE_URL,
+                PLATFORM.FALLBACK_AVATAR
+            ),
+            datetime: null, // Playlists don't have a specific date
+            url: url,
+            videoCount: videoCount,
+            contents: new ContentPager(videos, false)
+        });
+    } catch (error) {
+        logError(`Exception in getPlaylistByUrl: ${error.message}`);
+        showToast('Failed to load playlist.');
+        return null;
+    }
+}
+
+/**
+ * Extracts __NEXT_DATA__ from HTML and returns the requested pageProps property
+ * @param {string} html HTML content
+ * @param {string} propName Property name to extract from pageProps
+ * @returns {Object|null} Extracted data or null if not found
+ */
+function extractNextDataFromHtml(html, propName) {
+    try {
+        const doc = domParser.parseFromString(html, 'text/html');
+        const scriptElement = doc.querySelector('script#__NEXT_DATA__');
+        if (!scriptElement) {
+            logError('Could not find __NEXT_DATA__ script element');
+            return null;
+        }
+
+        const jsonData = safeJsonParse(scriptElement.text);
+        if (!jsonData?.props?.pageProps?.[propName]) {
+            logError(`Could not find ${propName} in __NEXT_DATA__`);
+            return null;
+        }
+
+        return jsonData.props.pageProps[propName];
+    } catch (error) {
+        logError(`Error extracting __NEXT_DATA__: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Converts a playlist video object to PlatformVideo
+ * @param {Object} video Video data from playlist
+ * @param {Object} extraData Additional metadata
+ * @returns {PlatformVideo} Formatted platform video object
+ */
+function convertPlaylistVideoToPlatformVideo(video, extraData) {
+    const slug = video.slug || '';
+    const videoUrl = `${PLATFORM.TALKS_URL}/${slug}`;
+
+    // Get thumbnail from primaryImageSet
+    let thumbnailUrl = '';
+    if (video.primaryImageSet && video.primaryImageSet.length > 0) {
+        thumbnailUrl = video.primaryImageSet[0].url || '';
+    }
+
+    // Fall back to extraData thumbnail if available
+    if (!thumbnailUrl && extraData?.playerData) {
+        thumbnailUrl = extractThumbnailUrl(extraData);
+    }
+
+    // Parse presenter name for author
+    const presenterName = video.presenterDisplayName || 'Unknown Speaker';
+    
+    // Get speaker info from extraData if available
+    const speaker = extraData?.speaker || extraData?.speakers?.[0] || null;
+    
+    const author = speaker ? createAuthorLink(speaker) : new PlatformAuthorLink(
+        new PlatformID(PLATFORM.NAME, presenterName, config.id),
+        presenterName,
+        PLATFORM.BASE_URL,
+        PLATFORM.FALLBACK_AVATAR
+    );
+
+    return new PlatformVideo({
+        id: new PlatformID(PLATFORM.NAME, video.id || slug, config.id),
+        name: video.title || 'Unknown TED Talk',
+        thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
+        author: author,
+        datetime: dateToUnixSeconds(video.publishedAt),
+        duration: safeParseInt(video.duration),
+        viewCount: video.viewedCount || 0,
+        url: videoUrl,
+        isLive: false
+    });
+}
+
+/**
+ * Extracts playlist ID and slug from a TED playlist URL
+ * @param {string} url TED playlist URL
+ * @returns {Object} Object with id and slug properties
+ */
+function extractPlaylistIdAndSlug(url) {
+    try {
+        const match = REGEX.PLAYLIST_ID_SLUG.exec(url);
+        if (match) {
+            return {
+                id: match[1] || null,
+                slug: match[2] || null
+            };
+        }
+        return { id: null, slug: null };
+    } catch (error) {
+        logError(`Exception in extractPlaylistIdAndSlug: ${error.message}`);
+        return { id: null, slug: null };
     }
 }
 

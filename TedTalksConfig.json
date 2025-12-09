@@ -16,6 +16,7 @@
   "subscriptionRateLimit": 10,
   "changelog": {
     "2": [
+      "Improvement: add playlist support;",
       "improvement: improve performance opening videos;"
     ]
   },
