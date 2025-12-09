@@ -70,7 +70,12 @@ source.enable = (conf, settings, saveStateStr) => {
  * @returns {ContentPager} Paged results for home page
  */
 source.getHome = () => {
-    return new TedTalksHomePager();
+    try {
+        return new TedTalksSearchPager("");
+    } catch (error) {
+        logError(`Failed to get TED Talks home page: ${error.message}`);
+        return new TedTalksHomePager();
+    }
 };
 
 /**
