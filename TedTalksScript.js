@@ -215,8 +215,10 @@ class TedTalksHomePager extends ContentPager {
                 return createEmptyPager();
             }
 
-            // Extract video data
-            const videos = responseData.data.videos.nodes.map(video => convertToPlatformVideoDetails(video, {}));
+            // Extract video data, filtering out podcast-only content
+            const videos = responseData.data.videos.nodes
+                .filter(video => hasPlayableVideoSources(video, {}))
+                .map(video => convertToPlatformVideoDetails(video, {}));
 
             // Update pagination info
             this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
@@ -293,8 +295,10 @@ class TedTalksSearchPager extends ContentPager {
             const slugs = hits.map(hit => hit.slug).filter(Boolean);
 
             const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
-            // Convert hits to videos
-            const videos = hits.map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
+            // Convert hits to videos, filtering out podcast-only content
+            const videos = hits
+                .filter(hit => hasPlayableVideoSources(hit, extraMetadata[hit.slug] || {}))
+                .map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
 
             // Calculate if there are more pages
             const totalHits = searchResults.nbHits || 0;
@@ -403,10 +407,12 @@ function getVideoRecommendations(url, relatedVideos) {
         const slugs = relatedVideos.map(video => video.slug);
         const metaSet = getVideoDetailsBySlugList(slugs);
 
-        // Convert related videos to platform videos
-        const videos = relatedVideos.map(relatedVideo => {
-            return convertToPlatformVideoDetails(relatedVideo, metaSet[relatedVideo.slug])
-        });
+        // Convert related videos to platform videos, filtering out podcast-only content
+        const videos = relatedVideos
+            .filter(relatedVideo => hasPlayableVideoSources(relatedVideo, metaSet[relatedVideo.slug]))
+            .map(relatedVideo => {
+                return convertToPlatformVideoDetails(relatedVideo, metaSet[relatedVideo.slug])
+            });
 
         return new ContentPager(videos, false);
     } catch (error) {
@@ -455,10 +461,12 @@ function getPlaylistByUrl(url) {
         const videoSlugs = (playlistData.videos?.nodes || []).map(v => v.slug).filter(Boolean);
         const extraMetadata = videoSlugs.length > 0 ? getVideoDetailsBySlugList(videoSlugs) : {};
 
-        // Convert playlist videos to platform videos
-        const videos = (playlistData.videos?.nodes || []).map(video => {
-            return convertPlaylistVideoToPlatformVideo(video, extraMetadata[video.slug] || {});
-        });
+        // Convert playlist videos to platform videos, filtering out podcast-only content
+        const videos = (playlistData.videos?.nodes || [])
+            .filter(video => hasPlayableVideoSources(video, extraMetadata[video.slug] || {}))
+            .map(video => {
+                return convertPlaylistVideoToPlatformVideo(video, extraMetadata[video.slug] || {});
+            });
 
         return new PlatformPlaylistDetails({
             id: new PlatformID(PLATFORM.NAME, playlistData.id || id, config.id),
@@ -612,8 +620,9 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
-        // Process videos and sort by date
+        // Process videos and sort by date, filtering out podcast-only content
         const videos = Object.values(extraMetadata)
+            .filter(video => hasPlayableVideoSources(video, {}))
             .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
             .map(video => {
                 // Filter speakers to only show the current channel speaker
@@ -751,6 +760,12 @@ function getVideoDetailsByUrl(url) {
         }
 
         const video = responseBody.data.videos.nodes[0];
+        
+        // Check if this is a podcast-only content (no native video sources)
+        if (!hasPlayableVideoSources(video, null)) {
+            throw new UnavailableException("This content is unavailable.");
+        }
+        
         const speaker = video.speakers?.nodes?.[0];
         const thumbnailUrl = extractThumbnailUrl(video);
 
@@ -988,6 +1003,36 @@ function mapSource(source, key, duration) {
 
     return sources;
 }
+
+/**
+ * Checks if a video has playable sources (not podcast-only content)
+ * Podcast-only videos have empty hlsUrl and are only available on YouTube
+ * @param {Object} videoData Video data from GraphQL or search API
+ * @param {Object} [extraData] Extra metadata for the video
+ * @returns {boolean} True if video has playable sources
+ */
+function hasPlayableVideoSources(videoData, extraData) {
+    // Check hlsUrl from videoData or extraData
+    const hlsUrl = videoData?.hlsUrl || extraData?.hlsUrl || '';
+    if (hlsUrl && typeof hlsUrl === 'string' && hlsUrl.trim() !== '') {
+        return true;
+    }
+    
+    // Check native downloads
+    const nativeDownloads = videoData?.nativeDownloads || extraData?.nativeDownloads;
+    if (nativeDownloads && (nativeDownloads.low || nativeDownloads.medium || nativeDownloads.high)) {
+        return true;
+    }
+    
+    // Check playerData for hls stream
+    const playerData = videoData?.playerData ? safeJsonParse(videoData.playerData) : null;
+    if (playerData?.resources?.hls?.stream) {
+        return true;
+    }
+    
+    return false;
+}
+
 /**
  * Converts TED Talk video data to platform-specific video format
  * @param {Object} videoData TED Talk video data
@@ -1034,6 +1079,14 @@ function convertToPlatformVideoDetails(videoData, extraData) {
        log('No thumbnails found for video');
     }
     
+    // Merge videoData and extraData for video sources - extraData contains hlsUrl from GraphQL
+    const mergedVideoData = {
+        ...videoData,
+        hlsUrl: videoData.hlsUrl || extraData?.hlsUrl,
+        nativeDownloads: videoData.nativeDownloads || extraData?.nativeDownloads,
+        playerData: videoData.playerData || extraData?.playerData
+    };
+    
     const details = new PlatformVideoDetails({
         id: new PlatformID(PLATFORM.NAME, slug || 'unknown', config.id),
         name: videoData.title || 'Unknown TED Talk',
@@ -1045,7 +1098,7 @@ function convertToPlatformVideoDetails(videoData, extraData) {
         uploadDate: dateToUnixSeconds(publishedAt),
         shareUrl: videoUrl,
         author: author,
-        video: createVideoSources(videoData)
+        video: createVideoSources(mergedVideoData)
     });
 
     const relatedVideos = Array.isArray(videoData?.relatedVideos) ? videoData.relatedVideos : [];
@@ -1064,13 +1117,18 @@ function convertToPlatformVideoDetails(videoData, extraData) {
  * @returns {Object} Speaker information with firstname, lastname, slug, id, and photoUrl
  */
 function extractSpeakerInfo(videoData, extraData) {
+    // Helper to check if a value is a valid speaker object (not a string or character)
+    const isValidSpeaker = (obj) => obj && typeof obj === 'object' && (obj.firstname || obj.lastname || obj.slug);
 
-    // Find the first available speaker source
+    // Find the first available speaker source (must be an object, not a string)
     const speakerSource = [
         videoData.speakers?.nodes?.[0],
-        videoData.speakers?.[0],
-        extraData?.speaker
-    ].find(source => source);
+        extraData?.speakers?.nodes?.[0],
+        extraData?.speakers?.[0],
+        extraData?.speaker,
+        // Only check videoData.speakers array if it's actually an array of objects
+        Array.isArray(videoData.speakers) ? videoData.speakers[0] : null
+    ].find(source => isValidSpeaker(source));
     
     // If a speaker source was found, extract information from it
     if (speakerSource) {
@@ -1080,6 +1138,17 @@ function extractSpeakerInfo(videoData, extraData) {
             slug: speakerSource.slug || '',
             id: speakerSource.id || '',
             photoUrl: speakerSource.photoUrl || PLATFORM.FALLBACK_AVATAR
+        };
+    }
+    
+    // Fallback: check if videoData.speakers is a string (from search API)
+    if (typeof videoData.speakers === 'string' && videoData.speakers.trim()) {
+        return {
+            firstname: videoData.speakers.trim(),
+            lastname: '',
+            slug: '',
+            id: '',
+            photoUrl: PLATFORM.FALLBACK_AVATAR
         };
     }
     
