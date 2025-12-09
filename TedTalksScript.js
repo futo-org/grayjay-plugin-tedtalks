@@ -1008,8 +1008,8 @@ function mapSource(source, key, duration) {
 }
 
 /**
- * Checks if a video has playable sources (not podcast-only content)
- * Podcast-only videos have empty hlsUrl and are only available on YouTube
+ * Checks if a video has playable sources nativelly in TED platform. This excluded content hosted on external platforms such as YouTube.
+ * Content that have empty hlsUrl and no download sources
  * @param {Object} videoData Video data from GraphQL or search API
  * @param {Object} [extraData] Extra metadata for the video
  * @returns {boolean} True if video has playable sources
