@@ -15,6 +15,9 @@
   "maxDownloadParallelism": 1,
   "subscriptionRateLimit": 10,
   "changelog": {
+    "3": [
+      "Fix: Extracting profile videos;"
+    ],
     "2": [
       "Improvement: add playlist support;",
       "improvement: improve performance opening videos;",

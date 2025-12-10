@@ -850,8 +850,8 @@ function getChannelContentsByUrl(url) {
             .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
             .map(video => {
                 // Filter speakers to only show the current channel speaker
-                if (video?.speakers) {
-                    video.speakers = video.speakers.filter(s => s.slug === channelSlug);
+                if (video?.speakers?.nodes) {
+                    video.speakers.nodes = video.speakers.nodes.filter(s => s.slug === channelSlug);
                 }
                 return convertToPlatformVideoDetails(video, {});
             });
