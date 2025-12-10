@@ -13,6 +13,7 @@ const PLATFORM = {
     GRAPHQL_URL: 'https://www.ted.com/graphql',
     SEARCH_URL: 'https://zenith-prod-alt.ted.com/api/search',
     SPEAKER_URL: 'https://www.ted.com/speakers',
+    PLAYLIST_URL: 'https://www.ted.com/playlists',
     FALLBACK_AVATAR: 'https://plugins.grayjay.app/TedTalks/media/speaker.png'
 };
 
@@ -20,9 +21,15 @@ const PLATFORM = {
 const REGEX = {
     SPEAKER_URL: /^https?:\/\/(www\.)?ted\.com\/speakers\/[^\/\s]+(\?.*)?$/i,
     TALK_URL: /^https?:\/\/(www\.)?ted\.com\/talks\/[^\/\s]+(\?.*)?$/i,
+    PLAYLIST_URL: /^https?:\/\/(www\.)?ted\.com\/playlists\/\d+(\/[a-zA-Z0-9_-]+)?$/i,
+    TOPIC_URL: /^https?:\/\/(www\.)?ted\.com\/topics\/[a-zA-Z0-9_+-]+$/i,
+    TOPIC_SLUG: /ted\.com\/topics\/([a-zA-Z0-9_+-]+)/i,
+    PLAYLIST_ID_SLUG: /ted\.com\/playlists\/(\d+)(?:\/([a-zA-Z0-9_-]+))?/i,
     SPEAKER_SLUG: /ted\.com\/speakers\/([a-zA-Z0-9_-]+)(?:\?|$)/,
     SPEAKER_ID: /speakerId=(\d+)/,
-    TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i
+    TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i,
+    HLS_URL: /https:\/\/.*\.m3u8/i,
+    MPEG_URL: /https:\/\/.*\.mp4/i
 };
 
 // Default request headers for TED API
@@ -54,6 +61,8 @@ const VIDEO_QUALITY = {
 // Plugin configuration storage
 let config = {};
 
+const IS_ANDROID = bridge.buildPlatform === "android";
+
 // ====================== PLUGIN ENTRY POINTS ======================
 
 /**
@@ -68,7 +77,12 @@ source.enable = (conf, settings, saveStateStr) => {
  * @returns {ContentPager} Paged results for home page
  */
 source.getHome = () => {
-    return new TedTalksSearchPager("");
+    try {
+        return new TedTalksSearchPager("");
+    } catch (error) {
+        logError(`Failed to get TED Talks home page: ${error.message}`);
+        return new TedTalksHomePager();
+    }
 };
 
 /**
@@ -143,7 +157,93 @@ source.getContentRecommendations = (url, relatedVideos) => {
     return getVideoRecommendations(url, relatedVideos);
 };
 
+/**
+ * Check if a URL is a TED playlist or topic
+ * @param {string} url URL to check
+ * @returns {boolean} True if the URL is a TED playlist or topic
+ */
+source.isPlaylistUrl = (url) => {
+    return urlMatches(url, REGEX.PLAYLIST_URL) || urlMatches(url, REGEX.TOPIC_URL);
+};
+
+/**
+ * Get playlist details from a TED playlist or topic URL
+ * @param {string} url Playlist or topic URL
+ * @returns {PlatformPlaylistDetails} Playlist details
+ */
+source.getPlaylist = (url) => {
+    // Check if this is a topic URL
+    if (urlMatches(url, REGEX.TOPIC_URL)) {
+        return getTopicAsPlaylist(url);
+    }
+    return getPlaylistByUrl(url);
+};
+
 // ====================== CUSTOM PAGER IMPLEMENTATIONS ======================
+/**
+ * Custom pager implementation for TED Talks home page
+ */
+class TedTalksHomePager extends ContentPager {
+    /**
+     * Creates a new TED Talks home pager
+     */
+    constructor() {
+        super([], true);
+        this.cursor = "0";
+        this.hasNextPage = true;
+        this.nextPage();
+    }
+
+    /**
+     * Fetches the next page of results
+     * @returns {ContentPager} Pager with the current page results
+     */
+    nextPage() {
+        try {
+            const queryInfo = {
+                query: GQL_QUERIES.HOME_VIDEOS,
+                variables: {
+                    first: 20,
+                    after: this.cursor,
+                    isPublished: true
+                }
+            };
+
+            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
+
+            if (!response.isOk) {
+                logError(`GraphQL request failed for home videos. Status: ${response.status}`);
+                showToast(`Failed to load TED Talks. Please try again later.`);
+                return createEmptyPager();
+            }
+
+            const responseData = safeJsonParse(response.body);
+            if (!responseData?.data?.videos?.nodes) {
+                logError('Invalid response format for home videos');
+                return createEmptyPager();
+            }
+
+            // Extract video data, filtering out podcast-only content
+            const videos = responseData.data.videos.nodes
+                .filter(video => hasPlayableVideoSources(video, {}))
+                .map(video => convertToPlatformVideoDetails(video, {}));
+
+            // Update pagination info
+            this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
+            this.cursor = responseData.data.videos.pageInfo.endCursor;
+
+            // Update results
+            this.results = videos;
+            this.hasMore = this.hasNextPage;
+
+            return this;
+        } catch (error) {
+            logError(`Exception in TedTalksHomePager.nextPage: ${error.message}`);
+            showToast(`Failed to load TED Talks: ${error.message}`);
+            return createEmptyPager();
+        }
+    }
+}
 
 /**
  * Custom pager implementation for TED Talks search results
@@ -158,6 +258,7 @@ class TedTalksSearchPager extends ContentPager {
         this.query = query;
         this.currentPage = 0;
         this.hitsPerPage = 24;
+        this.nextPage();
     }
 
     /**
@@ -179,31 +280,33 @@ class TedTalksSearchPager extends ContentPager {
             };
 
             const request = [{ "indexName": "newest", "params": searchParams }];
-            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS);
+            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS, { parseResponse: true });
 
             if (!response.isOk) {
                 logError(`Search API request failed. Status: ${response.status}, Query: "${this.query}", Page: ${this.currentPage}`);
                 showToast(`Failed to load TED Talks. Please try again later.`);
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             const searchResults = safeJsonParse(response.body)?.results?.[0];
             if (!searchResults?.hits) {
                 logError(`Invalid search response format for query: "${this.query}", Page: ${this.currentPage}`);
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             const hits = searchResults.hits;
             if (hits.length === 0) {
-                return new ContentPager([], false);
+                return createEmptyPager();
             }
 
             // Get additional metadata for the videos
             const slugs = hits.map(hit => hit.slug).filter(Boolean);
-            const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
 
-            // Convert hits to videos
-            const videos = hits.map(hit => convertToVideo(hit, extraMetadata[hit.slug] || {}));
+            const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
+            // Convert hits to videos, filtering out podcast-only content
+            const videos = hits
+                .filter(hit => hasPlayableVideoSources(hit, extraMetadata[hit.slug] || {}))
+                .map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
 
             // Calculate if there are more pages
             const totalHits = searchResults.nbHits || 0;
@@ -220,9 +323,97 @@ class TedTalksSearchPager extends ContentPager {
             // Return self
             return this;
         } catch (error) {
-            logError(`Exception in TedTalksSearchPager.nextPage: ${error.message}, Query: "${this.query}", Page: ${this.currentPage}`);
+            logError(`Exception in TedTalksSearchPager.nextPage: ${error.message}`);
             showToast(`Failed to load TED Talks: ${error.message}`);
-            return new ContentPager([], false);
+            return createEmptyPager();
+        }
+    }
+}
+
+/**
+ * Custom pager implementation for TED Talks topic results (paginated)
+ */
+class TedTalksTopicPager extends ContentPager {
+    /**
+     * Creates a new TED Talks topic pager
+     * @param {string} topicSlug Topic slug (e.g., "technology")
+     * @param {string} topicName Topic display name (e.g., "TED-Ed") for search filtering
+     */
+    constructor(topicSlug, topicName) {
+        super([], true);
+        this.topicSlug = topicSlug;
+        this.topicName = topicName || topicSlug.replace(/\+/g, ' ');
+        this.currentPage = 0;
+        this.hitsPerPage = 24;
+        this.nextPage();
+    }
+
+    /**
+     * Fetches the next page of results
+     * @returns {ContentPager} Pager with the current page results
+     */
+    nextPage() {
+        try {
+            const searchParams = {
+                "attributeForDistinct": "objectID",
+                "distinct": 1,
+                "facets": ["subtitle_languages", "tags"],
+                "filters": `tags:"${this.topicName}"`,
+                "highlightPostTag": "__/ais-highlight__",
+                "highlightPreTag": "__ais-highlight__",
+                "hitsPerPage": this.hitsPerPage,
+                "maxValuesPerFacet": 500,
+                "page": this.currentPage,
+                "query": ""
+            };
+
+            const request = [{ "indexName": "newest", "params": searchParams }];
+            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS, { parseResponse: true });
+
+            if (!response.isOk) {
+                logError(`Search API request failed for topic. Status: ${response.status}, Topic: "${this.topicSlug}", Page: ${this.currentPage}`);
+                showToast(`Failed to load topic videos. Please try again later.`);
+                return createEmptyPager();
+            }
+
+            const searchResults = safeJsonParse(response.body)?.results?.[0];
+            if (!searchResults?.hits) {
+                logError(`Invalid search response format for topic: "${this.topicSlug}", Page: ${this.currentPage}`);
+                return createEmptyPager();
+            }
+
+            const hits = searchResults.hits;
+            if (hits.length === 0) {
+                return createEmptyPager();
+            }
+
+            // Get additional metadata for the videos
+            const slugs = hits.map(hit => hit.slug).filter(Boolean);
+            const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
+
+            // Convert hits to videos, filtering out podcast-only content
+            const videos = hits
+                .filter(hit => hasPlayableVideoSources(hit, extraMetadata[hit.slug] || {}))
+                .map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
+
+            // Calculate if there are more pages
+            const totalHits = searchResults.nbHits || 0;
+            const totalPages = Math.ceil(totalHits / this.hitsPerPage);
+            const hasNextPage = this.currentPage < totalPages - 1;
+
+            // Increment the page for next time
+            this.currentPage++;
+
+            // Update results and hasMore
+            this.results = videos;
+            this.hasMore = hasNextPage;
+
+            // Return self
+            return this;
+        } catch (error) {
+            logError(`Exception in TedTalksTopicPager.nextPage: ${error.message}`);
+            showToast(`Failed to load topic videos: ${error.message}`);
+            return createEmptyPager();
         }
     }
 }
@@ -236,7 +427,7 @@ class TedTalksSearchPager extends ContentPager {
  */
 function searchSpeakers(query) {
     const url = `${PLATFORM.SPEAKER_URL}?sort=first&q=${encodeURIComponent(query)}`;
-    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { parseResponse: true });
 
     if (!response.isOk) {
         logError(`Failed to get speakers search page. Status: ${response.status}, URL: ${url}`);
@@ -288,20 +479,20 @@ function getVideoRecommendations(url, relatedVideos) {
         }
 
         // If related videos aren't provided, fetch them
-        if (!relatedVideos) {
+        if (!relatedVideos || !relatedVideos.length) {
             const responseBody = makeGraphQLRequest(
-                'VIDEO_DETAILS',
+                'RELATED',
                 { slug: slug, language: "en" },
-                "shareLinks"
+                "related"
             );
-
+            
             if (!responseBody?.data?.videos?.nodes || responseBody.data.videos.nodes.length === 0) {
                 logError(`No video data found for slug: ${slug}`);
                 return createEmptyPager();
             }
-
-            const video = responseBody.data.videos.nodes[0];
-            relatedVideos = video.relatedVideos || [];
+            
+            relatedVideos = responseBody?.data?.videos?.nodes?.[0]?.relatedVideos ?? [];
+            
         }
 
         if (!relatedVideos?.length) {
@@ -312,15 +503,307 @@ function getVideoRecommendations(url, relatedVideos) {
         const slugs = relatedVideos.map(video => video.slug);
         const metaSet = getVideoDetailsBySlugList(slugs);
 
-        // Convert related videos to platform videos
-        const videos = relatedVideos.map(relatedVideo => {
-            return convertToVideo(relatedVideo, metaSet[relatedVideo.slug])
-        });
+        // Convert related videos to platform videos, filtering out podcast-only content
+        const videos = relatedVideos
+            .filter(relatedVideo => hasPlayableVideoSources(relatedVideo, metaSet[relatedVideo.slug]))
+            .map(relatedVideo => {
+                return convertToPlatformVideoDetails(relatedVideo, metaSet[relatedVideo.slug])
+            });
 
         return new ContentPager(videos, false);
     } catch (error) {
         logError(`Exception in getVideoRecommendations: ${error.message}`);
         return createEmptyPager();
+    }
+}
+
+/**
+ * Gets playlist details from a TED playlist URL
+ * @param {string} url Playlist URL
+ * @returns {PlatformPlaylistDetails} Playlist details
+ */
+function getPlaylistByUrl(url) {
+    try {
+        const { id, slug } = extractPlaylistIdAndSlug(url);
+        if (!id) {
+            logError(`Could not extract playlist ID from URL: ${url}`);
+            showToast('Could not determine playlist from URL.');
+            return null;
+        }
+
+        // Fetch the playlist page to get data from __NEXT_DATA__
+        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+        if (!response.isOk) {
+            logError(`Failed to get playlist page. Status: ${response.status}, URL: ${url}`);
+            showToast('Failed to load playlist.');
+            return null;
+        }
+
+        // Extract playlist data from __NEXT_DATA__
+        const playlistData = extractNextDataFromHtml(response.body, 'playlist');
+        if (!playlistData) {
+            logError(`Could not extract playlist data from page: ${url}`);
+            showToast('Failed to parse playlist data.');
+            return null;
+        }
+
+        // Get thumbnail from primaryImageSet
+        const thumbnailUrl = playlistData.primaryImageSet?.[0]?.url || '';
+
+        // Get video count
+        const videoCount = playlistData.videos?.totalCount || playlistData.videos?.nodes?.length || 0;
+
+        // Get video slugs for fetching full metadata
+        const videoSlugs = (playlistData.videos?.nodes || []).map(v => v.slug).filter(Boolean);
+        const extraMetadata = videoSlugs.length > 0 ? getVideoDetailsBySlugList(videoSlugs) : {};
+
+        // Convert playlist videos to platform videos, filtering out podcast-only content
+        const videos = (playlistData.videos?.nodes || [])
+            .filter(video => hasPlayableVideoSources(video, extraMetadata[video.slug] || {}))
+            .map(video => {
+                return convertPlaylistVideoToPlatformVideo(video, extraMetadata[video.slug] || {});
+            });
+
+        return new PlatformPlaylistDetails({
+            id: new PlatformID(PLATFORM.NAME, playlistData.id || id, config.id),
+            name: playlistData.title || 'TED Playlist',
+            thumbnail: thumbnailUrl,
+            author: new PlatformAuthorLink(
+                new PlatformID(PLATFORM.NAME, 'TED', config.id),
+                playlistData.author || 'TED',
+                PLATFORM.BASE_URL,
+                PLATFORM.FALLBACK_AVATAR
+            ),
+            datetime: null, // Playlists don't have a specific date
+            url: url,
+            videoCount: videoCount,
+            contents: new ContentPager(videos, false)
+        });
+    } catch (error) {
+        logError(`Exception in getPlaylistByUrl: ${error.message}`);
+        showToast('Failed to load playlist.');
+        return null;
+    }
+}
+
+/**
+ * Gets a TED topic as a playlist
+ * @param {string} url Topic URL (e.g., https://www.ted.com/topics/technology)
+ * @returns {PlatformPlaylistDetails} Playlist details for the topic
+ */
+function getTopicAsPlaylist(url) {
+    try {
+        const topicSlug = extractTopicSlug(url);
+        if (!topicSlug) {
+            logError(`Could not extract topic slug from URL: ${url}`);
+            showToast('Could not determine topic from URL.');
+            return null;
+        }
+
+        // Get topic info from GraphQL
+        const topicInfo = getTopicInfo(topicSlug);
+        const topicName = topicInfo?.name || formatTopicName(topicSlug);
+
+        // Create a paginated pager for the topic videos (pass both slug and name)
+        const topicPager = new TedTalksTopicPager(topicSlug, topicName);
+
+        return new PlatformPlaylistDetails({
+            id: new PlatformID(PLATFORM.NAME, `topic-${topicSlug}`, config.id),
+            name: topicName,
+            thumbnail: '', // Topics don't have thumbnails
+            author: new PlatformAuthorLink(
+                new PlatformID(PLATFORM.NAME, 'TED', config.id),
+                'TED',
+                PLATFORM.BASE_URL,
+                PLATFORM.FALLBACK_AVATAR
+            ),
+            datetime: null,
+            url: url,
+            videoCount: -1, // Unknown total count, will be paginated
+            contents: topicPager
+        });
+    } catch (error) {
+        logError(`Exception in getTopicAsPlaylist: ${error.message}`);
+        showToast('Failed to load topic.');
+        return null;
+    }
+}
+
+/**
+ * Gets topic information from GraphQL API
+ * @param {string} topicSlug Topic slug
+ * @returns {Object|null} Topic info or null on error
+ */
+function getTopicInfo(topicSlug) {
+    try {
+        const queryInfo = {
+            query: GQL_QUERIES.TOPIC_INFO,
+            operationName: "topicInfo",
+            variables: { slug: topicSlug }
+        };
+
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true, throwOnError: false });
+
+        if (!response.isOk) {
+            return null;
+        }
+
+        const data = safeJsonParse(response.body);
+        return data?.data?.topic || null;
+    } catch (error) {
+        logError(`Exception in getTopicInfo: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Extracts topic slug from a TED topic URL
+ * @param {string} url TED topic URL
+ * @returns {string|null} Topic slug or null if not found
+ */
+function extractTopicSlug(url) {
+    try {
+        const match = REGEX.TOPIC_SLUG.exec(url);
+        return match ? match[1] : null;
+    } catch (error) {
+        logError(`Exception in extractTopicSlug: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Formats a topic slug into a display name
+ * @param {string} slug Topic slug (e.g., "personal+growth")
+ * @returns {string} Formatted name (e.g., "Personal Growth")
+ */
+function formatTopicName(slug) {
+    return slug
+        .replace(/\+/g, ' ')
+        .replace(/-/g, ' ')
+        .split(' ')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+}
+
+/**
+ * Builds video description with topic links appended
+ * @param {string} description Original video description
+ * @param {Array} topics Array of topic objects with { name, slug }
+ * @returns {string} Description with topic links
+ */
+function buildDescriptionWithTopics(description, topics) {
+    if (!topics || topics.length === 0) {
+        return description;
+    }
+
+    if (IS_ANDROID) {
+        // Android: Add clickable topic links (matching TED's display format)
+        const topicLinks = topics.map(topic => {
+            // Use slug directly - TED URLs use + for spaces, not %2B
+            const url = `${PLATFORM.BASE_URL}/topics/${topic.slug}`;
+            return `<a href="${url}">${topic.name}</a>`;
+        }).join(' • ');
+        return description + '\n\nTopics: ' + topicLinks;
+    } else {
+        // Desktop: Add plain text topics (links not yet supported)
+        const topicText = topics.map(topic => topic.name).join(', ');
+        return description + '\n\nTopics: ' + topicText;
+    }
+}
+
+/**
+ * Extracts __NEXT_DATA__ from HTML and returns the requested pageProps property
+ * @param {string} html HTML content
+ * @param {string} propName Property name to extract from pageProps
+ * @returns {Object|null} Extracted data or null if not found
+ */
+function extractNextDataFromHtml(html, propName) {
+    try {
+        const doc = domParser.parseFromString(html, 'text/html');
+        const scriptElement = doc.querySelector('script#__NEXT_DATA__');
+        if (!scriptElement) {
+            logError('Could not find __NEXT_DATA__ script element');
+            return null;
+        }
+
+        const jsonData = safeJsonParse(scriptElement.text);
+        if (!jsonData?.props?.pageProps?.[propName]) {
+            logError(`Could not find ${propName} in __NEXT_DATA__`);
+            return null;
+        }
+
+        return jsonData.props.pageProps[propName];
+    } catch (error) {
+        logError(`Error extracting __NEXT_DATA__: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Converts a playlist video object to PlatformVideo
+ * @param {Object} video Video data from playlist
+ * @param {Object} extraData Additional metadata
+ * @returns {PlatformVideo} Formatted platform video object
+ */
+function convertPlaylistVideoToPlatformVideo(video, extraData) {
+    const slug = video.slug || '';
+    const videoUrl = `${PLATFORM.TALKS_URL}/${slug}`;
+
+    // Get thumbnail from primaryImageSet
+    let thumbnailUrl = '';
+    if (video.primaryImageSet && video.primaryImageSet.length > 0) {
+        thumbnailUrl = video.primaryImageSet[0].url || '';
+    }
+
+    // Fall back to extraData thumbnail if available
+    if (!thumbnailUrl && extraData?.playerData) {
+        thumbnailUrl = extractThumbnailUrl(extraData);
+    }
+
+    // Parse presenter name for author
+    const presenterName = video.presenterDisplayName || 'Unknown Speaker';
+    
+    // Get speaker info from extraData if available
+    const speaker = extraData?.speaker || extraData?.speakers?.[0] || null;
+    
+    const author = speaker ? createAuthorLink(speaker) : new PlatformAuthorLink(
+        new PlatformID(PLATFORM.NAME, presenterName, config.id),
+        presenterName,
+        PLATFORM.BASE_URL,
+        PLATFORM.FALLBACK_AVATAR
+    );
+
+    return new PlatformVideo({
+        id: new PlatformID(PLATFORM.NAME, video.id || slug, config.id),
+        name: video.title || 'Unknown TED Talk',
+        thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
+        author: author,
+        datetime: dateToUnixSeconds(video.publishedAt),
+        duration: safeParseInt(video.duration),
+        viewCount: video.viewedCount || 0,
+        url: videoUrl,
+        isLive: false
+    });
+}
+
+/**
+ * Extracts playlist ID and slug from a TED playlist URL
+ * @param {string} url TED playlist URL
+ * @returns {Object} Object with id and slug properties
+ */
+function extractPlaylistIdAndSlug(url) {
+    try {
+        const match = REGEX.PLAYLIST_ID_SLUG.exec(url);
+        if (match) {
+            return {
+                id: match[1] || null,
+                slug: match[2] || null
+            };
+        }
+        return { id: null, slug: null };
+    } catch (error) {
+        logError(`Exception in extractPlaylistIdAndSlug: ${error.message}`);
+        return { id: null, slug: null };
     }
 }
 
@@ -337,11 +820,14 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
-        // Fetch the speaker page
-        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+        // Construct clean speaker URL without query parameters (some URLs have ?speakerId= which returns 404)
+        const cleanUrl = `${PLATFORM.BASE_URL}/speakers/${channelSlug}`;
+
+        // Fetch the speaker page (don't throw on error, handle gracefully)
+        const response = makeRequestWithRetry('GET', cleanUrl, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
         if (!response.isOk) {
-            logError(`Failed to get channel page. Status: ${response.status}, URL: ${url}`);
-            showToast('Failed to load speaker page or speaker does not have a profile yet.');
+            logError(`Failed to get channel page. Status: ${response.status}, URL: ${cleanUrl}`);
+            showToast('Speaker does not have a profile page yet.');
             return createEmptyPager();
         }
 
@@ -358,15 +844,16 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
-        // Process videos and sort by date
+        // Process videos and sort by date, filtering out podcast-only content
         const videos = Object.values(extraMetadata)
+            .filter(video => hasPlayableVideoSources(video, {}))
             .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
             .map(video => {
                 // Filter speakers to only show the current channel speaker
                 if (video?.speakers) {
                     video.speakers = video.speakers.filter(s => s.slug === channelSlug);
                 }
-                return convertToVideo(video, {});
+                return convertToPlatformVideoDetails(video, {});
             });
 
         return new ContentPager(videos, false);
@@ -497,26 +984,47 @@ function getVideoDetailsByUrl(url) {
         }
 
         const video = responseBody.data.videos.nodes[0];
-        const sources = createVideoSources(video);
+        
+        // Check if this is a podcast-only content (no native video sources)
+        if (!hasPlayableVideoSources(video, null)) {
+            throw new UnavailableException("This content is unavailable.");
+        }
+        
         const speaker = video.speakers?.nodes?.[0];
         const thumbnailUrl = extractThumbnailUrl(video);
+        
+        // Build description with topic links
+        const description = buildDescriptionWithTopics(video.description || '', video.topics?.nodes || []);
+
+        // Fetch subtitles
+        let subtitles = [];
+        if (video.playerData) {
+            const playerData = safeJsonParse(video.playerData);
+            const metadataUrl = playerData?.resources?.hls?.metadata;
+            if (metadataUrl) {
+                subtitles = fetchSubtitles(metadataUrl);
+            }
+        }
 
         const details = new PlatformVideoDetails({
             id: new PlatformID(PLATFORM.NAME, video.canonicalUrl || slug, config.id),
             name: video.title || 'Unknown TED Talk',
             author: speaker ? createAuthorLink(speaker) : null,
             datetime: dateToUnixSeconds(video.publishedAt),
-            description: video.description || '',
+            description: description,
             url: url,
-            video: new VideoSourceDescriptor(sources),
+            video: createVideoSources(video),
             duration: safeParseInt(video.duration),
             thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
             viewCount: video.viewedCount || 0,
+            subtitles: subtitles
         });
+
+        const relatedVideos = Array.isArray(video?.relatedVideos) ? video.relatedVideos : [];
 
         // Add method to get recommendations without refetching video data
         details.getContentRecommendations = () => {
-            return source.getContentRecommendations(url, video.relatedVideos);
+            return source.getContentRecommendations(url, relatedVideos);
         };
 
         return details;
@@ -548,7 +1056,7 @@ function makeGraphQLRequest(queryName, variables, operationName) {
             variables: variables
         };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
 
         if (!response.isOk) {
             logError(`GraphQL request failed. Query: ${queryName}, Status: ${response.status}`);
@@ -569,152 +1077,371 @@ function makeGraphQLRequest(queryName, variables, operationName) {
  */
 function getVideoDetailsBySlugList(slugs) {
     try {
-        if (!slugs || !slugs.length) {
-            return null;
-        }
-
-        const responseBody = makeGraphQLRequest(
-            'VIDEOS_INFO_BY_SLUG',
-            { slug: slugs },
-            "videosInfo"
-        );
-
-        if (!responseBody?.data?.videos?.nodes) {
-            return null;
-        }
-
-        // Process the response into a lookup table by slug
-        return responseBody.data.videos.nodes.reduce((result, video) => {
-            if (video.slug) {
-                const speakers = video.speakers?.nodes || [];
-                video.speakers = speakers;
-                video.speaker = speakers[0] || null;
-                result[video.slug] = video;
+        const query = {
+            query: GQL_QUERIES.VIDEOS_INFO_BY_SLUG,
+            variables: {
+                slug: slugs
             }
-            return result;
+        };
+
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { parseResponse: true, throwOnError: false });
+
+        if (!response.isOk) {
+            return {};
+        }
+
+        const data = safeJsonParse(response.body);
+        const videos = data?.data?.videos?.nodes || [];
+        
+        // Convert array to map keyed by slug
+        return videos.reduce((acc, video) => {
+            if (video.slug) {
+                acc[video.slug] = video;
+            }
+            return acc;
         }, {});
     } catch (error) {
         logError(`Exception in getVideoDetailsBySlugList: ${error.message}`);
-        return null;
+        return {};
     }
 }
 
 /**
- * Makes an HTTP request with a single retry on failure
- * @param {string} method HTTP method ('GET' or 'POST')
- * @param {string} url URL to request
- * @param {Object|string} body Request body (for POST)
- * @param {Object} headers HTTP headers
- * @returns {Object} HTTP response
+ * Fetches subtitles from the HLS metadata URL
+ * @param {string} metadataUrl URL to the HLS metadata JSON
+ * @returns {Array<SubtitleSource>} Array of subtitle sources
  */
-function makeRequestWithRetry(method, url, body, headers) {
+function fetchSubtitles(metadataUrl) {
     try {
-        let response;
-        if (method === 'GET') {
-            response = http.GET(url, headers);
-        } else if (method === 'POST') {
-            response = http.POST(url, body, headers);
-        } else {
-            throw new Error(`Unsupported HTTP method: ${method}`);
+        const response = makeRequestWithRetry('GET', metadataUrl, null, {}, { parseResponse: true });
+        if (!response.isOk) {
+            logError(`Subtitle request failed: ${response.status}`);
+            return [];
         }
-
-        // If the request was successful, return the response
-        if (response.isOk) {
-            return response;
+        
+        const metadata = safeJsonParse(response.body);
+        if (!metadata?.subtitles) {
+            logError(`No subtitles found in metadata`);
+            return [];
         }
-
-        // If the request failed, log the error and retry once
-        logError(`HTTP ${method} request to ${url} failed with status ${response.status}. Retrying...`);
-
-        // Retry the request immediately
-        if (method === 'GET') {
-            return http.GET(url, headers);
-        } else {
-            return http.POST(url, body, headers);
-        }
+        
+        return metadata.subtitles.map(sub => ({
+            format: "text/vtt",
+            url: sub.webvtt,
+            name: sub.name
+        }));
     } catch (error) {
-        logError(`Exception in makeRequestWithRetry: ${error.message}`);
+        logError(`Failed to fetch subtitles: ${error.message}`);
+        return [];
+    }
+}
 
-        // Retry the request
+/**
+ * Makes an HTTP request with automatic retries and error handling
+ * 
+ * @param {string} method - HTTP method ('GET', 'POST', etc.)
+ * @param {string} url - The URL to make the request to
+ * @param {string|Object|null} body - Request body for POST/PUT requests
+ * @param {Object} headers - HTTP headers for the request
+ * @param {Object} options - Additional options
+ * @param {boolean} [options.useAuth=false] - Whether to use authentication for the request
+ * @param {boolean} [options.parseResponse=false] - Whether to parse the response as JSON
+ * @param {number} [options.maxRetries=3] - Maximum number of retry attempts
+ * @param {boolean} [options.throwOnError=false] - Whether to throw an exception on error
+ * @returns {Object} - Response object with isOk, code, and body properties
+ */
+function makeRequestWithRetry(method, url, body = null, headers = {}, options = {}) {
+    const {
+        useAuth = false,
+        parseResponse = false,
+        maxRetries = 4,
+        throwOnError = true
+    } = options;
+    
+    let remainingAttempts = maxRetries + 1; // +1 for the initial attempt
+    let lastResponse = null;
+    let lastError = null;
+    
+    while (remainingAttempts > 0) {
+
         try {
-            if (method === 'GET') {
-                return http.GET(url, headers);
+            let response;
+            
+            // Make the appropriate type of request based on method
+            if (method.toUpperCase() === 'GET') {
+                // using object spread due to issue on desktop when modifying the object with response.parsedBody
+                response = {...http.GET(url, headers, useAuth)};
+            } else if (method.toUpperCase() === 'POST') {
+                // using object spread due to issue on desktop when modifying the object with response.parsedBody
+                response = {...http.POST(url, body, headers, useAuth)};
             } else {
-                return http.POST(url, body, headers);
+                throw new ScriptException(`Unsupported HTTP method: ${method}`);
             }
-        } catch (retryError) {
-            logError(`Retry also failed: ${retryError.message}`);
-            // Return a dummy response to avoid crashes
-            return { isOk: false, status: 0, body: "{}" };
+            
+            // If request was successful, optionally parse the response
+            if (response.isOk && parseResponse) {
+                try {
+                    
+                    response.parsedBody = JSON.parse(response.body);
+                    
+                    // Check for API error responses that might be in a 200 response
+                    if (response.parsedBody.errors) {
+                        const errorMsg = `API returned error: ${JSON.stringify(response.parsedBody.errors)}`;
+                        logError(errorMsg);
+                        if (throwOnError) {
+                            throw new ScriptException(errorMsg);
+                        }
+                    }
+                } catch (parseError) {
+                    
+                    const errorMsg = `Failed to parse response as JSON: ${parseError.message}`;
+                    logError(errorMsg);
+                    if (throwOnError) {
+                        throw new ScriptException(errorMsg);
+                    }
+                }
+            }
+            
+            // Return on success
+            if (response.isOk) {
+                return response;
+            }
+            
+            // Save the failed response and log the error
+            lastResponse = response;
+            const errorMsg = `${method} request to ${url} failed with status ${response.code}`;
+            logError(`${errorMsg}. Attempts left: ${remainingAttempts - 1}`);
+            
+            if (throwOnError) {
+                throw new ScriptException(errorMsg);
+            }
+            
+            remainingAttempts--;
+            
+        } catch (error) {
+            // Save the error and log it
+            lastError = error;
+            logError(`Exception in ${method} request to ${url}: ${error.message}. Attempts left: ${remainingAttempts - 1}`);
+            
+            if (throwOnError && remainingAttempts <= 1) {
+                throw error;
+            }
+            
+            remainingAttempts--;
         }
     }
+    
+    // All retry attempts have failed, return last response or construct a dummy response
+    if (lastResponse) {
+        return lastResponse;
+    }
+    
+    // Create a dummy response if we don't have a real one
+    return { 
+        isOk: false, 
+        code: 0,
+        status: 0,
+        body: JSON.stringify({ error: lastError ? lastError.message : `${method} request failed after all retry attempts` }) 
+    };
 }
 
 // ====================== CONVERSION FUNCTIONS ======================
 
+function mapSource(source, key, duration) {
+    let sources = [];
+    if (REGEX.HLS_URL.test(source.stream)) {
+        sources.push(
+            new HLSSource({
+                name: key,
+                url: source.stream,
+                duration: duration
+            }),
+        );
+    } else if (REGEX.MPEG_URL.test(source.file)) {
+        sources.push(
+            new VideoUrlSource({
+                name: key,
+                duration: duration,
+                url: source.file,
+                container: "video/mp4"
+            }),
+        );
+    }
+
+    return sources;
+}
+
+/**
+ * Checks if a video has playable sources nativelly in TED platform. This excluded content hosted on external platforms such as YouTube.
+ * Content that have empty hlsUrl and no download sources
+ * @param {Object} videoData Video data from GraphQL or search API
+ * @param {Object} [extraData] Extra metadata for the video
+ * @returns {boolean} True if video has playable sources
+ */
+function hasPlayableVideoSources(videoData, extraData) {
+    // Check hlsUrl from videoData or extraData
+    const hlsUrl = videoData?.hlsUrl || extraData?.hlsUrl || '';
+    if (hlsUrl && typeof hlsUrl === 'string' && hlsUrl.trim() !== '') {
+        return true;
+    }
+    
+    // Check native downloads
+    const nativeDownloads = videoData?.nativeDownloads || extraData?.nativeDownloads;
+    if (nativeDownloads && (nativeDownloads.low || nativeDownloads.medium || nativeDownloads.high)) {
+        return true;
+    }
+    
+    // Check playerData for hls stream
+    const playerData = videoData?.playerData ? safeJsonParse(videoData.playerData) : null;
+    if (playerData?.resources?.hls?.stream) {
+        return true;
+    }
+    
+    return false;
+}
+
 /**
  * Converts TED Talk video data to platform-specific video format
  * @param {Object} videoData TED Talk video data
- * @param {Object} extraData Extra metadata for the video
+ * @param {Object} [extraData] Extra metadata for the video
  * @returns {PlatformVideo} Formatted platform video object
+ * @throws {ScriptException} If videoData is invalid or missing required properties
  */
-function convertToVideo(videoData, extraData) {
-    try {
-        const videoUrl = `${PLATFORM.TALKS_URL}/${videoData.slug || ''}`;
+function convertToPlatformVideoDetails(videoData, extraData) {
 
-        // Get speaker information, with fallbacks
-        const speaker = extractSpeakerInfo(videoData, extraData);
-
-        const viewedCount = videoData?.viewedCount || extraData?.viewedCount || 0;
-        const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
-
-        // Create author link
-        const author = createAuthorLink({
-            id: speaker.id,
-            firstname: speaker.firstname,
-            lastname: speaker.lastname,
-            slug: speaker.slug,
-            photoUrl: speaker.photoUrl
-        });
-
-        // Extract thumbnails
-        const thumbnails = extractThumbnails(videoData, extraData);
-
-        return new PlatformVideo({
-            id: new PlatformID(PLATFORM.NAME, videoData.slug || 'unknown', config.id),
-            name: videoData.title || 'Unknown TED Talk',
-            thumbnails: new Thumbnails(thumbnails),
-            duration: safeParseInt(videoData.duration),
-            viewCount: viewedCount,
-            url: videoUrl,
-            uploadDate: dateToUnixSeconds(publishedAt),
-            shareUrl: videoUrl,
-            author: author
-        });
-    } catch (error) {
-        logError(`Exception in convertToVideo: ${error.message}`);
-
-        // Return a minimal valid video object with available data
-        return createFallbackVideo(videoData);
+    if (!videoData || typeof videoData !== 'object') {
+        throw new ScriptException('Invalid videoData: Expected an object');
     }
+    
+    // Ensure extraData is an object if provided
+    extraData = extraData && typeof extraData === 'object' ? extraData : {};
+    
+    // Get the video slug with validation
+    const slug = videoData.slug || '';
+    if (!slug) {
+        log('Video slug is missing or empty');
+    }
+    
+    const videoUrl = `${PLATFORM.TALKS_URL}/${slug}`;
+    
+    // Get speaker information, with fallbacks
+    const speaker = extractSpeakerInfo(videoData, extraData);
+
+    const viewedCount = videoData?.viewedCount || extraData?.viewedCount || 0;
+    const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
+    const duration = safeParseInt(videoData.duration);
+
+    // Create author link
+    const author = createAuthorLink({
+        id: speaker.id,
+        firstname: speaker.firstname,
+        lastname: speaker.lastname,
+        slug: speaker.slug,
+        photoUrl: speaker.photoUrl
+    });
+    
+    // Extract thumbnails
+    const thumbnails = extractThumbnails(videoData, extraData) || [];
+    if (!thumbnails || !thumbnails.length) {
+       log('No thumbnails found for video');
+    }
+    
+    // Merge videoData and extraData for video sources - extraData contains hlsUrl from GraphQL
+    const mergedVideoData = {
+        ...videoData,
+        hlsUrl: videoData.hlsUrl || extraData?.hlsUrl,
+        nativeDownloads: videoData.nativeDownloads || extraData?.nativeDownloads,
+        playerData: videoData.playerData || extraData?.playerData
+    };
+    
+    // Build description with topic links
+    const topics = videoData.topics?.nodes || extraData?.topics?.nodes || [];
+    const description = buildDescriptionWithTopics(videoData.description || extraData?.description || '', topics);
+    
+    // Fetch subtitles if playerData is available
+    let subtitles = [];
+    if (mergedVideoData.playerData) {
+        const playerData = safeJsonParse(mergedVideoData.playerData);
+        const metadataUrl = playerData?.resources?.hls?.metadata;
+        if (metadataUrl) {
+            subtitles = fetchSubtitles(metadataUrl);
+        }
+    }
+    
+    const details = new PlatformVideoDetails({
+        id: new PlatformID(PLATFORM.NAME, slug || 'unknown', config.id),
+        name: videoData.title || 'Unknown TED Talk',
+        thumbnails: new Thumbnails(thumbnails),
+        description: description,
+        duration: duration,
+        viewCount: viewedCount,
+        url: videoUrl,
+        uploadDate: dateToUnixSeconds(publishedAt),
+        shareUrl: videoUrl,
+        author: author,
+        video: createVideoSources(mergedVideoData),
+        subtitles: subtitles
+    });
+
+    const relatedVideos = Array.isArray(videoData?.relatedVideos) ? videoData.relatedVideos : [];
+    
+    details.getContentRecommendations = () => {
+        return source.getContentRecommendations(videoUrl, relatedVideos);
+    };
+
+    return details;
 }
 
 /**
  * Extracts speaker information from video data
  * @param {Object} videoData Video data
  * @param {Object} extraData Additional metadata
- * @returns {Object} Speaker information
+ * @returns {Object} Speaker information with firstname, lastname, slug, id, and photoUrl
  */
 function extractSpeakerInfo(videoData, extraData) {
-    const speaker = {};
+    // Helper to check if a value is a valid speaker object (not a string or character)
+    const isValidSpeaker = (obj) => obj && typeof obj === 'object' && (obj.firstname || obj.lastname || obj.slug);
 
-    speaker.firstname = videoData?.speakers?.[0]?.firstname || extraData?.speaker?.firstname || '';
-    speaker.lastname = videoData?.speakers?.[0]?.lastname || extraData?.speaker?.lastname || '';
-    speaker.slug = videoData?.speakers?.[0]?.slug || extraData?.speaker?.slug || '';
-    speaker.id = videoData?.speakers?.[0]?.id || extraData?.speaker?.id || '';
-    speaker.photoUrl = videoData?.speakers?.[0]?.photoUrl || extraData?.speaker?.photoUrl || PLATFORM.FALLBACK_AVATAR;
-
-    return speaker;
+    // Find the first available speaker source (must be an object, not a string)
+    const speakerSource = [
+        videoData.speakers?.nodes?.[0],
+        extraData?.speakers?.nodes?.[0],
+        extraData?.speakers?.[0],
+        extraData?.speaker,
+        // Only check videoData.speakers array if it's actually an array of objects
+        Array.isArray(videoData.speakers) ? videoData.speakers[0] : null
+    ].find(source => isValidSpeaker(source));
+    
+    // If a speaker source was found, extract information from it
+    if (speakerSource) {
+        return {
+            firstname: speakerSource.firstname || '',
+            lastname: speakerSource.lastname || '',
+            slug: speakerSource.slug || '',
+            id: speakerSource.id || '',
+            photoUrl: speakerSource.photoUrl || PLATFORM.FALLBACK_AVATAR
+        };
+    }
+    
+    // Fallback: check if videoData.speakers is a string (from search API)
+    if (typeof videoData.speakers === 'string' && videoData.speakers.trim()) {
+        return {
+            firstname: videoData.speakers.trim(),
+            lastname: '',
+            slug: '',
+            id: '',
+            photoUrl: PLATFORM.FALLBACK_AVATAR
+        };
+    }
+    
+    // Return a default speaker object if no information was found
+    return {
+        firstname: 'Unknown Speaker',
+        lastname: '',
+        slug: '',
+        id: '',
+        photoUrl: PLATFORM.FALLBACK_AVATAR
+    };
 }
 
 /**
@@ -740,26 +1467,6 @@ function extractThumbnails(videoData, extraData) {
     return thumbnails;
 }
 
-/**
- * Creates a fallback video object with minimal data
- * @param {Object} videoData Basic video data
- * @returns {PlatformVideo} Minimal video object
- */
-function createFallbackVideo(videoData) {
-    return new PlatformVideo({
-        id: new PlatformID(PLATFORM.NAME, videoData.slug || "unknown", config.id),
-        name: videoData.title || "Unknown TED Talk",
-        thumbnails: new Thumbnails([]),
-        duration: 0,
-        url: `${PLATFORM.TALKS_URL}/${videoData.slug || ""}`,
-        author: new PlatformAuthorLink(
-            new PlatformID(PLATFORM.NAME, "unknown", config.id),
-            "Unknown Speaker",
-            "",
-            PLATFORM.FALLBACK_AVATAR
-        )
-    });
-}
 
 /**
  * Creates a PlatformAuthorLink for a speaker
@@ -787,48 +1494,28 @@ function createAuthorLink(speaker) {
  * @returns {Array} Array of video source objects
  */
 function createVideoSources(video) {
-    try {
-        const sources = [];
-        const duration = safeParseInt(video.duration);
+    const videoSources = [];
+    
+    const duration = safeParseInt(video.duration);
 
-        // Add HLS source if available
-        if (video.hlsUrl) {
-            sources.push(
-                new HLSSource({
-                    name: 'HLS',
-                    url: video.hlsUrl,
-                    duration: duration,
-                    priority: true
-                })
-            );
-        }
-
-        // Add MP4 sources for different qualities
-        if (video.nativeDownloads) {
-            addMp4Sources(sources, video.nativeDownloads, duration);
-        }
-
-        return sources;
-    } catch (error) {
-        logError(`Exception in createVideoSources: ${error.message}`);
-        return [];
+    // Add HLS source if available
+    if (video.hlsUrl) {
+        videoSources.push(
+            new HLSSource({
+                name: 'HLS',
+                url: video.hlsUrl,
+                duration: duration
+            })
+        );
     }
-}
 
-/**
- * Adds MP4 video sources to the sources array
- * @param {Array} sources Array to add sources to
- * @param {Object} downloads Download URLs for different qualities
- * @param {number} duration Video duration
- */
-function addMp4Sources(sources, downloads, duration) {
-    // Low quality
-    if (downloads.low) {
-        sources.push(
+    // Add MP4 sources for different qualities
+    if (video?.nativeDownloads?.low) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.LOW.name,
                 duration: duration,
-                url: downloads.low,
+                url: video?.nativeDownloads?.low,
                 width: VIDEO_QUALITY.LOW.width,
                 height: VIDEO_QUALITY.LOW.height,
                 container: "video/mp4"
@@ -837,12 +1524,12 @@ function addMp4Sources(sources, downloads, duration) {
     }
 
     // Medium quality
-    if (downloads.medium) {
-        sources.push(
+    if (video?.nativeDownloads?.medium) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.MEDIUM.name,
                 duration: duration,
-                url: downloads.medium,
+                url: video?.nativeDownloads?.medium,
                 width: VIDEO_QUALITY.MEDIUM.width,
                 height: VIDEO_QUALITY.MEDIUM.height,
                 container: "video/mp4"
@@ -851,18 +1538,55 @@ function addMp4Sources(sources, downloads, duration) {
     }
 
     // High quality
-    if (downloads.high) {
-        sources.push(
+    if (video?.nativeDownloads?.high) {
+        videoSources.push(
             new VideoUrlSource({
                 name: VIDEO_QUALITY.HIGH.name,
                 duration: duration,
-                url: downloads.high,
+                url: video?.nativeDownloads?.medium,
                 width: VIDEO_QUALITY.HIGH.width,
                 height: VIDEO_QUALITY.HIGH.height,
                 container: "video/mp4"
             })
         );
     }
+
+    const playerData = video?.playerData;
+
+    if (!videoSources.length && playerData) {
+
+        try {
+            const playerData = safeJsonParse(playerData);
+            if (playerData?.resources) {
+                for (let key in playerData.resources) {
+                    const sourceType = playerData.resources[key];
+                    if (Array.isArray(sourceType)) {
+                        sourceType.forEach(source => {
+                            videoSources.push(...mapSource(source, key, duration));
+                        });
+                    } else {
+                        videoSources.push(...mapSource(sourceType, key, duration));
+                    }
+                }
+            }
+        } catch (playerDataError) {
+            logError(`Error processing playerData: ${playerDataError.message}`);
+        }
+    }
+
+    // Audio source has diferent duration, and includes some narration in the beginning. Could be used in an audio only mode
+    // if(video.audioDownload){
+    //     audioSources.push(
+    //         new AudioUrlSource({
+    //             name: "audio/mp3",
+    //             duration: duration,
+    //             url: video.audioDownload,
+    //             container: "audio/mp3"
+    //         })
+    //     );
+    // }
+
+    return new VideoSourceDescriptor(videoSources);
 }
 
 // ====================== UTILITY FUNCTIONS ======================
@@ -891,6 +1615,7 @@ function safeParseInt(value) {
         const parsed = parseInt(value);
         return isNaN(parsed) ? 0 : parsed;
     } catch (error) {
+        logError(`Integer parse error: ${error.message}`);
         return 0;
     }
 }
@@ -961,7 +1686,7 @@ function extractTedSlug(url) {
  * @param {string} channelSlug Channel slug for filtering
  * @returns {Array<string>} Array of talk slugs
  */
-function extractTalkSlugsFromHtml(html) {
+function extractTalkSlugsFromHtml(html, channelSlug) {
     try {
         const talkElements = domParser
             .parseFromString(html, 'text/html')
@@ -1084,7 +1809,48 @@ function showToast(message) {
 }
 
 // ====================== GRAPHQL QUERIES ======================
+
 const GQL_QUERIES = {
+    HOME_VIDEOS: `
+query Videos($first: Int, $after: String) {
+	videos(first: $first, after: $after) {
+		nodes {
+			nativeDownloads {
+				high
+				low
+				medium
+			}
+            canonicalUrl
+			audioDownload
+			playerData
+			duration
+			description
+			hlsUrl
+			slug
+			id
+			language
+			publishedAt
+			title
+			viewedCount
+			speakers {
+				nodes {
+					id
+					firstname
+					lastname
+					slug
+					photoUrl
+				}
+			}
+		}
+		pageInfo {
+			endCursor
+			hasNextPage
+			startCursor
+		}
+	}
+}
+
+`,
     VIDEO_DETAILS: `
     query shareLinks($slug: String!, $language: String) {
         videos(
@@ -1098,19 +1864,33 @@ const GQL_QUERIES = {
                 id
                 viewedCount
                 playerData
-                hasTranslations
                 publishedAt
                 hlsUrl
-                fallbackUrl
                 canonicalUrl
-                audioDownload
                 title
                 description
+                topics {
+                    nodes {
+                        id
+                        name
+                        slug
+                    }
+                }
                 relatedVideos {
                     title
                     slug
                     id
                     duration
+                    hlsUrl
+                    canonicalUrl
+                    videoDownloads {
+                        nodes {
+                            url
+                        }
+                    }
+                    viewedCount
+                    publishedAt
+                    recordedOn
                     speakers {
                         nodes {
                             id
@@ -1136,12 +1916,6 @@ const GQL_QUERIES = {
                     medium
                     high
                 }
-                subtitledDownloads {
-                    low
-                    high
-                    internalLanguageCode
-                    languageName
-                }
             }
         }
     }
@@ -1153,6 +1927,9 @@ const GQL_QUERIES = {
                 id
                 title
                 slug
+                hlsUrl
+                description
+                canonicalUrl
                 viewedCount
                 publishedAt
                 duration
@@ -1165,6 +1942,18 @@ const GQL_QUERIES = {
                         slug
                         photoUrl
                     }
+                }
+                topics {
+                    nodes {
+                        id
+                        name
+                        slug
+                    }
+                }
+                nativeDownloads {
+                    low
+                    medium
+                    high
                 }
             }
             totalCount
@@ -1187,5 +1976,55 @@ const GQL_QUERIES = {
             whoTheyAre
         }
     }
+    `,
+    RELATED: `
+    query related($slug: String!, $language: String) {
+	videos(
+		slug: [$slug]
+		language: $language
+		first: 1
+		isPublished: [true]
+		channel: ALL
+	) {
+		nodes {
+			relatedVideos {
+				title
+				slug
+				id
+				duration
+				hlsUrl
+                canonicalUrl
+				videoDownloads {
+					nodes {
+						url
+					}
+				}
+				viewedCount
+				publishedAt
+				recordedOn
+				speakers {
+					nodes {
+						id
+						firstname
+						lastname
+						slug
+						photoUrl
+					}
+				}
+			}
+		}
+	}
+}
+    `,
+    TOPIC_INFO: `
+    query topicInfo($slug: String!) {
+        topic(slug: $slug) {
+            id
+            name
+            slug
+        }
+    }
     `
 };
+
+log('LOADED');
