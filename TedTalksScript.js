@@ -996,6 +996,16 @@ function getVideoDetailsByUrl(url) {
         // Build description with topic links
         const description = buildDescriptionWithTopics(video.description || '', video.topics?.nodes || []);
 
+        // Fetch subtitles
+        let subtitles = [];
+        if (video.playerData) {
+            const playerData = safeJsonParse(video.playerData);
+            const metadataUrl = playerData?.resources?.hls?.metadata;
+            if (metadataUrl) {
+                subtitles = fetchSubtitles(metadataUrl);
+            }
+        }
+
         const details = new PlatformVideoDetails({
             id: new PlatformID(PLATFORM.NAME, video.canonicalUrl || slug, config.id),
             name: video.title || 'Unknown TED Talk',
@@ -1007,6 +1017,7 @@ function getVideoDetailsByUrl(url) {
             duration: safeParseInt(video.duration),
             thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
             viewCount: video.viewedCount || 0,
+            subtitles: subtitles
         });
 
         const relatedVideos = Array.isArray(video?.relatedVideos) ? video.relatedVideos : [];
@@ -1066,33 +1077,62 @@ function makeGraphQLRequest(queryName, variables, operationName) {
  */
 function getVideoDetailsBySlugList(slugs) {
     try {
-        if (!slugs || !slugs.length) {
-            return null;
-        }
-
-        const responseBody = makeGraphQLRequest(
-            'VIDEOS_INFO_BY_SLUG',
-            { slug: slugs },
-            "videosInfo"
-        );
-
-        if (!responseBody?.data?.videos?.nodes) {
-            return null;
-        }
-
-        // Process the response into a lookup table by slug
-        return responseBody.data.videos.nodes.reduce((result, video) => {
-            if (video.slug) {
-                const speakers = video.speakers?.nodes || [];
-                video.speakers = speakers;
-                video.speaker = speakers[0] || null;
-                result[video.slug] = video;
+        const query = {
+            query: GQL_QUERIES.VIDEOS_INFO_BY_SLUG,
+            variables: {
+                slug: slugs
             }
-            return result;
+        };
+
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { parseResponse: true, throwOnError: false });
+
+        if (!response.isOk) {
+            return {};
+        }
+
+        const data = safeJsonParse(response.body);
+        const videos = data?.data?.videos?.nodes || [];
+        
+        // Convert array to map keyed by slug
+        return videos.reduce((acc, video) => {
+            if (video.slug) {
+                acc[video.slug] = video;
+            }
+            return acc;
         }, {});
     } catch (error) {
         logError(`Exception in getVideoDetailsBySlugList: ${error.message}`);
-        return null;
+        return {};
+    }
+}
+
+/**
+ * Fetches subtitles from the HLS metadata URL
+ * @param {string} metadataUrl URL to the HLS metadata JSON
+ * @returns {Array<SubtitleSource>} Array of subtitle sources
+ */
+function fetchSubtitles(metadataUrl) {
+    try {
+        const response = makeRequestWithRetry('GET', metadataUrl, null, {}, { parseResponse: true });
+        if (!response.isOk) {
+            logError(`Subtitle request failed: ${response.status}`);
+            return [];
+        }
+        
+        const metadata = safeJsonParse(response.body);
+        if (!metadata?.subtitles) {
+            logError(`No subtitles found in metadata`);
+            return [];
+        }
+        
+        return metadata.subtitles.map(sub => ({
+            format: "text/vtt",
+            url: sub.webvtt,
+            name: sub.name
+        }));
+    } catch (error) {
+        logError(`Failed to fetch subtitles: ${error.message}`);
+        return [];
     }
 }
 
@@ -1318,6 +1358,16 @@ function convertToPlatformVideoDetails(videoData, extraData) {
     const topics = videoData.topics?.nodes || extraData?.topics?.nodes || [];
     const description = buildDescriptionWithTopics(videoData.description || extraData?.description || '', topics);
     
+    // Fetch subtitles if playerData is available
+    let subtitles = [];
+    if (mergedVideoData.playerData) {
+        const playerData = safeJsonParse(mergedVideoData.playerData);
+        const metadataUrl = playerData?.resources?.hls?.metadata;
+        if (metadataUrl) {
+            subtitles = fetchSubtitles(metadataUrl);
+        }
+    }
+    
     const details = new PlatformVideoDetails({
         id: new PlatformID(PLATFORM.NAME, slug || 'unknown', config.id),
         name: videoData.title || 'Unknown TED Talk',
@@ -1329,7 +1379,8 @@ function convertToPlatformVideoDetails(videoData, extraData) {
         uploadDate: dateToUnixSeconds(publishedAt),
         shareUrl: videoUrl,
         author: author,
-        video: createVideoSources(mergedVideoData)
+        video: createVideoSources(mergedVideoData),
+        subtitles: subtitles
     });
 
     const relatedVideos = Array.isArray(videoData?.relatedVideos) ? videoData.relatedVideos : [];
@@ -1635,7 +1686,7 @@ function extractTedSlug(url) {
  * @param {string} channelSlug Channel slug for filtering
  * @returns {Array<string>} Array of talk slugs
  */
-function extractTalkSlugsFromHtml(html) {
+function extractTalkSlugsFromHtml(html, channelSlug) {
     try {
         const talkElements = domParser
             .parseFromString(html, 'text/html')
