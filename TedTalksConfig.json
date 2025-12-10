@@ -17,7 +17,8 @@
   "changelog": {
     "2": [
       "Improvement: add playlist support;",
-      "improvement: improve performance opening videos;"
+      "improvement: improve performance opening videos;",
+      "Improvement: add support for TED topics as playlists;"
     ]
   },
   "packages": [
