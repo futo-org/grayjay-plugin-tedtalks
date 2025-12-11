@@ -7,7 +7,7 @@
   "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
   "scriptUrl": "./TedTalksScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/tedtalks",
-  "version": 2,
+  "version": 3,
   "iconUrl": "./TedTalksIcon.png",
   "id": "8d029a7f-5507-4e36-8bd8-c19a3b77d383",
   "scriptSignature": "",
@@ -15,6 +15,12 @@
   "maxDownloadParallelism": 1,
   "subscriptionRateLimit": 10,
   "changelog": {
+    "3": [
+      "Fix: Extracting profile videos;",
+      "Fix: Handling external content (podcasts hosted on youtube);",
+      "Improvement: Add setting to control external content visibility;",
+      "Fix: Searching channels (speakers);"
+    ],
     "2": [
       "Improvement: add playlist support;",
       "improvement: improve performance opening videos;",
@@ -29,5 +35,13 @@
   "allowUrls": [
     ".ted.com"
   ],
-  "settings": []
+  "settings": [
+    {
+      "variable": "showExternalContent",
+      "name": "Show External Content",
+      "description": "Show content hosted on third party platforms (e.g., YouTube) as nested content that may require another plugin. If no plugin can handle the content it will be opened in the browser.",
+      "type": "Boolean",
+      "default": "true"
+    }
+  ]
 }
