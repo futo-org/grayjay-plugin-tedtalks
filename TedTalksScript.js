@@ -61,6 +61,11 @@ const VIDEO_QUALITY = {
 // Plugin configuration storage
 let config = {};
 
+// Plugin settings storage
+let _settings = {
+    showExternalContent: false
+};
+
 const IS_ANDROID = bridge.buildPlatform === "android";
 
 // ====================== PLUGIN ENTRY POINTS ======================
@@ -70,6 +75,9 @@ const IS_ANDROID = bridge.buildPlatform === "android";
  */
 source.enable = (conf, settings, saveStateStr) => {
     config = conf;
+    if (settings) {
+        _settings.showExternalContent = settings.showExternalContent === true || settings.showExternalContent === "true";
+    }
 };
 
 /**
@@ -223,10 +231,15 @@ class TedTalksHomePager extends ContentPager {
                 return createEmptyPager();
             }
 
-            // Extract video data, filtering out podcast-only content
+            // Extract video data, filtering out podcast-only content (unless external content handling is "Show")
             const videos = responseData.data.videos.nodes
-                .filter(video => hasPlayableVideoSources(video, {}))
-                .map(video => convertToPlatformVideoDetails(video, {}));
+                .filter(video => shouldShowContent(video, {}))
+                .map(video => {
+                    if (hasPlayableVideoSources(video, {})) {
+                        return convertToPlatformVideoDetails(video, {});
+                    }
+                    return convertToNestedMediaContent(video, {});
+                });
 
             // Update pagination info
             this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
@@ -303,10 +316,16 @@ class TedTalksSearchPager extends ContentPager {
             const slugs = hits.map(hit => hit.slug).filter(Boolean);
 
             const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
-            // Convert hits to videos, filtering out podcast-only content
+            // Convert hits to videos, filtering out podcast-only content (unless external content handling is "Show")
             const videos = hits
-                .filter(hit => hasPlayableVideoSources(hit, extraMetadata[hit.slug] || {}))
-                .map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
+                .filter(hit => shouldShowContent(hit, extraMetadata[hit.slug] || {}))
+                .map(hit => {
+                    const extra = extraMetadata[hit.slug] || {};
+                    if (hasPlayableVideoSources(hit, extra)) {
+                        return convertToPlatformVideoDetails(hit, extra);
+                    }
+                    return convertToNestedMediaContent(hit, extra);
+                });
 
             // Calculate if there are more pages
             const totalHits = searchResults.nbHits || 0;
@@ -391,10 +410,16 @@ class TedTalksTopicPager extends ContentPager {
             const slugs = hits.map(hit => hit.slug).filter(Boolean);
             const extraMetadata = getVideoDetailsBySlugList(slugs) || {};
 
-            // Convert hits to videos, filtering out podcast-only content
+            // Convert hits to videos, filtering out podcast-only content (unless external content handling is "Show")
             const videos = hits
-                .filter(hit => hasPlayableVideoSources(hit, extraMetadata[hit.slug] || {}))
-                .map(hit => convertToPlatformVideoDetails(hit, extraMetadata[hit.slug] || {}));
+                .filter(hit => shouldShowContent(hit, extraMetadata[hit.slug] || {}))
+                .map(hit => {
+                    const extra = extraMetadata[hit.slug] || {};
+                    if (hasPlayableVideoSources(hit, extra)) {
+                        return convertToPlatformVideoDetails(hit, extra);
+                    }
+                    return convertToNestedMediaContent(hit, extra);
+                });
 
             // Calculate if there are more pages
             const totalHits = searchResults.nbHits || 0;
@@ -427,7 +452,7 @@ class TedTalksTopicPager extends ContentPager {
  */
 function searchSpeakers(query) {
     const url = `${PLATFORM.SPEAKER_URL}?sort=first&q=${encodeURIComponent(query)}`;
-    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { parseResponse: true });
+    const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
 
     if (!response.isOk) {
         logError(`Failed to get speakers search page. Status: ${response.status}, URL: ${url}`);
@@ -503,11 +528,15 @@ function getVideoRecommendations(url, relatedVideos) {
         const slugs = relatedVideos.map(video => video.slug);
         const metaSet = getVideoDetailsBySlugList(slugs);
 
-        // Convert related videos to platform videos, filtering out podcast-only content
+        // Convert related videos to platform videos, filtering out podcast-only content (unless external content handling is "Show")
         const videos = relatedVideos
-            .filter(relatedVideo => hasPlayableVideoSources(relatedVideo, metaSet[relatedVideo.slug]))
+            .filter(relatedVideo => shouldShowContent(relatedVideo, metaSet[relatedVideo.slug]))
             .map(relatedVideo => {
-                return convertToPlatformVideoDetails(relatedVideo, metaSet[relatedVideo.slug])
+                const extra = metaSet[relatedVideo.slug];
+                if (hasPlayableVideoSources(relatedVideo, extra)) {
+                    return convertToPlatformVideoDetails(relatedVideo, extra);
+                }
+                return convertToNestedMediaContent(relatedVideo, extra);
             });
 
         return new ContentPager(videos, false);
@@ -557,11 +586,15 @@ function getPlaylistByUrl(url) {
         const videoSlugs = (playlistData.videos?.nodes || []).map(v => v.slug).filter(Boolean);
         const extraMetadata = videoSlugs.length > 0 ? getVideoDetailsBySlugList(videoSlugs) : {};
 
-        // Convert playlist videos to platform videos, filtering out podcast-only content
+        // Convert playlist videos to platform videos, filtering out podcast-only content (unless external content handling is "Show")
         const videos = (playlistData.videos?.nodes || [])
-            .filter(video => hasPlayableVideoSources(video, extraMetadata[video.slug] || {}))
+            .filter(video => shouldShowContent(video, extraMetadata[video.slug] || {}))
             .map(video => {
-                return convertPlaylistVideoToPlatformVideo(video, extraMetadata[video.slug] || {});
+                const extra = extraMetadata[video.slug] || {};
+                if (hasPlayableVideoSources(video, extra)) {
+                    return convertPlaylistVideoToPlatformVideo(video, extra);
+                }
+                return convertToNestedMediaContent(video, extra);
             });
 
         return new PlatformPlaylistDetails({
@@ -844,16 +877,19 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
-        // Process videos and sort by date, filtering out podcast-only content
+        // Process videos and sort by date, filtering out podcast-only content (unless external content handling is "Show")
         const videos = Object.values(extraMetadata)
-            .filter(video => hasPlayableVideoSources(video, {}))
+            .filter(video => shouldShowContent(video, {}))
             .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
             .map(video => {
                 // Filter speakers to only show the current channel speaker
                 if (video?.speakers?.nodes) {
                     video.speakers.nodes = video.speakers.nodes.filter(s => s.slug === channelSlug);
                 }
-                return convertToPlatformVideoDetails(video, {});
+                if (hasPlayableVideoSources(video, {})) {
+                    return convertToPlatformVideoDetails(video, {});
+                }
+                return convertToNestedMediaContent(video, {});
             });
 
         return new ContentPager(videos, false);
@@ -985,8 +1021,14 @@ function getVideoDetailsByUrl(url) {
 
         const video = responseBody.data.videos.nodes[0];
         
-        // Check if this is a podcast-only content (no native video sources)
+        // Check if this is content without native video sources
         if (!hasPlayableVideoSources(video, null)) {
+            // Check if it's external content (e.g., YouTube, Vimeo)
+            const externalUrl = getExternalContentUrl(video, null);
+            if (externalUrl) {
+                const provider = getContentProviderFromUrl(externalUrl);
+                throw new UnavailableException(`This talk is hosted on ${provider}. Opening external content via shared links is not supported for now. Try browsing TED Talks using the Grayjay plugin.`);
+            }
             throw new UnavailableException("This content is unavailable.");
         }
         
@@ -1030,6 +1072,11 @@ function getVideoDetailsByUrl(url) {
         return details;
     } catch (error) {
         logError(`Exception in getVideoDetailsByUrl: ${error.message}`);
+
+        if (error instanceof UnavailableException) {
+            throw error;
+        }
+
         return null;
     }
 }
@@ -1125,11 +1172,13 @@ function fetchSubtitles(metadataUrl) {
             return [];
         }
         
-        return metadata.subtitles.map(sub => ({
-            format: "text/vtt",
-            url: sub.webvtt,
-            name: sub.name
-        }));
+        return metadata.subtitles
+            .filter(sub => sub && sub.webvtt)
+            .map(sub => ({
+                format: "text/vtt",
+                url: sub.webvtt,
+                name: sub.name || 'Unknown'
+            }));
     } catch (error) {
         logError(`Failed to fetch subtitles: ${error.message}`);
         return [];
@@ -1301,6 +1350,134 @@ function hasPlayableVideoSources(videoData, extraData) {
 }
 
 /**
+ * Extracts the external URL (e.g., YouTube) from video data if it's externally hosted content
+ * @param {Object} videoData Video data from GraphQL or search API
+ * @param {Object} [extraData] Extra metadata for the video
+ * @returns {string|null} External URL or null if not externally hosted
+ */
+function getExternalContentUrl(videoData, extraData) {
+    // Check playerData for external resources
+    const playerDataStr = videoData?.playerData || extraData?.playerData;
+    const playerData = playerDataStr ? safeJsonParse(playerDataStr) : null;
+    
+    // Check for external embedded content (like YouTube)
+    // TED stores external content as { service: "YouTube", code: "VIDEO_ID" }
+    if (playerData?.external?.service && playerData?.external?.code) {
+        const service = playerData.external.service.toLowerCase();
+        const code = playerData.external.code;
+        
+        if (service === 'youtube') {
+            return `https://www.youtube.com/watch?v=${code}`;
+        }
+        if (service === 'vimeo') {
+            return `https://vimeo.com/${code}`;
+        }
+        // Add more services as discovered
+    }
+    
+    // Check for direct URI (fallback)
+    if (playerData?.external?.uri) {
+        return playerData.external.uri;
+    }
+    
+    return null;
+}
+
+/**
+ * Checks if content should be shown based on external content handling setting
+ * @param {Object} videoData Video data from GraphQL or search API  
+ * @param {Object} [extraData] Extra metadata for the video
+ * @returns {boolean} True if content should be shown (either native or external with Show setting)
+ */
+function shouldShowContent(videoData, extraData) {
+    // If has native playable sources, always show
+    if (hasPlayableVideoSources(videoData, extraData)) {
+        return true;
+    }
+    
+    // If showExternalContent is enabled, show external content too
+    if (_settings.showExternalContent) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Extracts the content provider name from a URL
+ * @param {string} url The URL to analyze
+ * @returns {string} Provider name (e.g., "YouTube", "Vimeo") or "External Platform"
+ */
+function getContentProviderFromUrl(url) {
+    if (!url) return 'External Platform';
+    
+    const urlLower = url.toLowerCase();
+    if (urlLower.includes('youtube.com') || urlLower.includes('youtu.be')) {
+        return 'YouTube';
+    }
+    if (urlLower.includes('vimeo.com')) {
+        return 'Vimeo';
+    }
+    if (urlLower.includes('dailymotion.com')) {
+        return 'Dailymotion';
+    }
+    
+    return 'External Platform';
+}
+
+/**
+ * Converts video data to PlatformNestedMediaContent for externally hosted content
+ * @param {Object} videoData Video data from GraphQL or search API
+ * @param {Object} [extraData] Extra metadata for the video
+ * @returns {PlatformNestedMediaContent} Nested media content object
+ */
+function convertToNestedMediaContent(videoData, extraData) {
+    // Ensure extraData is an object if provided
+    extraData = extraData && typeof extraData === 'object' ? extraData : {};
+    
+    const slug = videoData.slug || '';
+    const tedUrl = `${PLATFORM.TALKS_URL}/${slug}`;
+    const thumbnailUrl = extractThumbnailUrl(videoData, extraData);
+    
+    // Try to get the actual external URL (e.g., YouTube URL)
+    const externalUrl = getExternalContentUrl(videoData, extraData);
+    
+    // Use external URL if available, otherwise fall back to TED URL
+    // When contentUrl is the actual YouTube URL, Grayjay can hand it off to the YouTube plugin
+    const contentUrl = externalUrl || tedUrl;
+    const contentProvider = getContentProviderFromUrl(externalUrl);
+    
+    // Get speaker information
+    const speaker = extractSpeakerInfo(videoData, extraData);
+    
+    const author = createAuthorLink({
+        id: speaker.id,
+        firstname: speaker.firstname,
+        lastname: speaker.lastname,
+        slug: speaker.slug,
+        photoUrl: speaker.photoUrl
+    });
+    
+    const publishedAt = videoData?.publishedAt || extraData?.publishedAt || null;
+    
+    // Build thumbnails - filter empty URLs before creating Thumbnail objects
+    const thumbnailSources = thumbnailUrl ? [new Thumbnail(thumbnailUrl, 1)] : [];
+    
+    return new PlatformNestedMediaContent({
+        id: new PlatformID(PLATFORM.NAME, videoData.canonicalUrl || slug, config.id),
+        name: videoData.title || 'Unknown TED Talk',
+        author: author,
+        datetime: dateToUnixSeconds(publishedAt),
+        url: tedUrl,                            // The TED page where content is embedded
+        contentUrl: contentUrl,                 // The actual external URL (YouTube, etc.) or TED URL
+        contentName: videoData.title || 'Unknown TED Talk',
+        contentDescription: videoData.description || '',
+        contentProvider: contentProvider,       // e.g., "YouTube" or "External Platform"
+        contentThumbnails: new Thumbnails(thumbnailSources)
+    });
+}
+
+/**
  * Converts TED Talk video data to platform-specific video format
  * @param {Object} videoData TED Talk video data
  * @param {Object} [extraData] Extra metadata for the video
@@ -1451,10 +1628,10 @@ function extractSpeakerInfo(videoData, extraData) {
  * @returns {Array} Array of Thumbnail objects
  */
 function extractThumbnails(videoData, extraData) {
-    // Try to get thumbnails from photo_sizes
-    let thumbnails = (videoData?.photos?.[0]?.photo_sizes || []).map(size => {
-        return new Thumbnail(size.url, safeParseInt(size.height));
-    });
+    // Try to get thumbnails from photo_sizes - filter out items without valid URLs
+    let thumbnails = (videoData?.photos?.[0]?.photo_sizes || [])
+        .filter(size => size && size.url)
+        .map(size => new Thumbnail(size.url, safeParseInt(size.height)));
 
     // Try to add a thumbnail from playerData if none found
     if (thumbnails.length === 0) {
@@ -1688,9 +1865,25 @@ function extractTedSlug(url) {
  */
 function extractTalkSlugsFromHtml(html, channelSlug) {
     try {
-        const talkElements = domParser
-            .parseFromString(html, 'text/html')
-            .querySelectorAll('div.profile-talks__talk');
+        // Use regex to extract talk URLs - more reliable than DOM parsing
+        const talkUrlRegex = /href=['"]\/talks\/([a-z0-9_]+)['"]/gi;
+        const slugs = [];
+        let match;
+        while ((match = talkUrlRegex.exec(html)) !== null) {
+            const slug = match[1];
+            // Avoid duplicates
+            if (slug && !slugs.includes(slug)) {
+                slugs.push(slug);
+            }
+        }
+        
+        if (slugs.length > 0) {
+            return slugs;
+        }
+        
+        // Fallback to DOM parsing if regex fails
+        const doc = domParser.parseFromString(html, 'text/html');
+        const talkElements = doc.querySelectorAll('div.profile-talks__talk');
         
         if (!talkElements || talkElements.length === 0) {
             return [];
@@ -1699,11 +1892,12 @@ function extractTalkSlugsFromHtml(html, channelSlug) {
         return Array
             .from(talkElements)
             .map(el => {
-                const a = el.querySelector('a.ga-link');
+                // Try multiple selectors to find the link
+                const a = el.querySelector('a[href*="/talks/"]') || el.querySelector('a.ga-link');
                 if (!a) return null;
                 
                 const relativelinkUrl = a.getAttribute('href');
-                if (!relativelinkUrl) return null;
+                if (!relativelinkUrl || !relativelinkUrl.includes('/talks/')) return null;
                 
                 return extractTedSlug(`${PLATFORM.BASE_URL}${relativelinkUrl}`);
             })
@@ -1752,14 +1946,27 @@ function formatName(firstName, lastName) {
 /**
  * Extracts thumbnail URL from video data
  * @param {Object} video Video data
+ * @param {Object} [extraData] Extra metadata for the video
  * @returns {string} Thumbnail URL or empty string
  */
-function extractThumbnailUrl(video) {
+function extractThumbnailUrl(video, extraData) {
     try {
-        if (video?.playerData) {
-            const playerData = safeJsonParse(video.playerData);
-            return playerData?.thumb || '';
+        // Check playerData.thumb first (most reliable, includes CDN optimization)
+        const playerDataStr = video?.playerData || extraData?.playerData;
+        if (playerDataStr) {
+            const playerData = safeJsonParse(playerDataStr);
+            if (playerData?.thumb) {
+                return playerData.thumb;
+            }
         }
+        
+        // Check primaryImageSet from GraphQL
+        const primaryImageSet = video?.primaryImageSet || extraData?.primaryImageSet;
+        if (primaryImageSet && primaryImageSet.length > 0 && primaryImageSet[0].url) {
+            // Add TED CDN prefix for optimization
+            return `https://pi.tedcdn.com/r/${primaryImageSet[0].url.replace(/^https?:\/\//, '')}?quality=89&w=600`;
+        }
+        
         return '';
     } catch (error) {
         logError(`Error extracting thumbnail: ${error.message}`);

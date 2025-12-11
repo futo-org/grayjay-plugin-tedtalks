@@ -16,7 +16,10 @@
   "subscriptionRateLimit": 10,
   "changelog": {
     "3": [
-      "Fix: Extracting profile videos;"
+      "Fix: Extracting profile videos;",
+      "Fix: Handling external content (podcasts hosted on youtube);",
+      "Improvement: Add setting to control external content visibility;",
+      "Fix: Searching channels (speakers);"
     ],
     "2": [
       "Improvement: add playlist support;",
@@ -32,5 +35,13 @@
   "allowUrls": [
     ".ted.com"
   ],
-  "settings": []
+  "settings": [
+    {
+      "variable": "showExternalContent",
+      "name": "Show External Content",
+      "description": "Show content hosted on third party platforms (e.g., YouTube) as nested content that may require another plugin. If no plugin can handle the content it will be opened in the browser.",
+      "type": "Boolean",
+      "default": "true"
+    }
+  ]
 }
