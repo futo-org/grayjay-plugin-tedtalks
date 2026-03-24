@@ -3,7 +3,7 @@
   "platformUrl": "https://www.ted.com/talks",
   "description": "TED Talks are influential videos from expert speakers on education, business, science, tech and creativity",
   "author": "FUTO",
-  "authorUrl": "https://futo.org",
+  "authorUrl": "https://futo.tech",
   "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
   "scriptUrl": "./TedTalksScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/tedtalks",
