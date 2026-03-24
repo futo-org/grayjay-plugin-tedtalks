@@ -32,6 +32,9 @@
     "Http",
     "DOMParser"
   ],
+  "packagesOptional": [
+    "HttpImp"
+  ],
   "allowUrls": [
     ".ted.com"
   ],
@@ -40,6 +43,13 @@
       "variable": "showExternalContent",
       "name": "Show External Content",
       "description": "Show content hosted on third party platforms (e.g., YouTube) as nested content that may require another plugin. If no plugin can handle the content it will be opened in the browser.",
+      "type": "Boolean",
+      "default": "true"
+    },
+    {
+      "variable": "useBrowserImpersonation",
+      "name": "Browser Impersonation",
+      "description": "Use TLS fingerprint impersonation (HttpImp) to bypass bot detection and SSL issues. Disable if you experience connection problems.",
       "type": "Boolean",
       "default": "true"
     }

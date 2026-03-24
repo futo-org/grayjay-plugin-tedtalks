@@ -63,10 +63,15 @@ let config = {};
 
 // Plugin settings storage
 let _settings = {
-    showExternalContent: false
+    showExternalContent: false,
+    useBrowserImpersonation: true
 };
 
 const IS_ANDROID = bridge.buildPlatform === "android";
+const IS_DESKTOP = bridge.buildPlatform === "desktop";
+
+const IMPERSONATION_TARGET = IS_DESKTOP ? 'chrome136' : 'chrome131_android';
+const IS_IMPERSONATION_AVAILABLE = (typeof httpimp !== 'undefined');
 
 // ====================== PLUGIN ENTRY POINTS ======================
 
@@ -77,6 +82,13 @@ source.enable = (conf, settings, saveStateStr) => {
     config = conf;
     if (settings) {
         _settings.showExternalContent = settings.showExternalContent === true || settings.showExternalContent === "true";
+        _settings.useBrowserImpersonation = settings.useBrowserImpersonation !== false && settings.useBrowserImpersonation !== "false";
+    }
+    if (IS_IMPERSONATION_AVAILABLE) {
+        const httpImpClient = httpimp.getDefaultClient(true);
+        if (httpImpClient.setDefaultImpersonateTarget) {
+            httpImpClient.setDefaultImpersonateTarget(IMPERSONATION_TARGET);
+        }
     }
 };
 
