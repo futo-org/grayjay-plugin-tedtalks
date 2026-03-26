@@ -984,7 +984,7 @@ function getChannelContentsByUrl(url) {
         const response = makeRequestWithRetry('GET', cleanUrl, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
         if (!response.isOk) {
             trace(`Failed to get channel page. Status: ${response.status}, URL: ${cleanUrl}`);
-            trace('Speaker does not have a profile page yet.');
+            trace('Speaker does not have a profile page yet.', { showToast: true });
             return createEmptyPager();
         }
 
@@ -1089,7 +1089,7 @@ function getChannelByHTML(url) {
     const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
     if (!response.isOk) {
         trace(`Failed to get channel page. Status: ${response.status}, URL: ${url}`);
-        trace('Speaker profile not found. This TED speaker may not have a public profile yet.');
+        trace('Speaker profile not found. This TED speaker may not have a public profile yet.', { showToast: true });
         throw new UnavailableException("Not able to access speaker page.");
     }
 
@@ -2161,9 +2161,11 @@ function createEmptyPager() {
 /**
  * Logs a message and optionally shows a toast notification (when verbose setting is enabled)
  * @param {string} msg Message
+ * @param {Object} [options] Options
+ * @param {boolean} [options.showToast=false] Whether to show a toast notification
  */
-function trace(msg) {
-    if (_settings.verboseNotifications) {
+function trace(msg, { showToast = false } = {}) {
+    if (_settings.verboseNotifications || showToast) {
         bridge.toast(msg);
     }
     log(msg);
