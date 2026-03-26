@@ -97,11 +97,29 @@ source.enable = (conf, settings, saveStateStr) => {
  * @returns {ContentPager} Paged results for home page
  */
 source.getHome = () => {
+    // 1. Web scraping: fetches /talks?sort=newest HTML and parses __NEXT_DATA__.
+    //    All requests go through www.ted.com (no SSL renegotiation issues).
+    try {
+        return new TedTalksWebPager();
+    } catch (error) {
+        logError(`WebPager failed: ${error.message}`);
+    }
+
+    // 2. Search API: POST to zenith-prod-alt.ted.com/api/search.
+    //    Fast but this endpoint requests SSL/TLS renegotiation which can cause intermittent failures.
     try {
         return new TedTalksSearchPager("");
     } catch (error) {
-        logError(`Failed to get TED Talks home page: ${error.message}`);
+        logError(`SearchPager failed: ${error.message}`);
+    }
+
+    // 3. GraphQL: POST to www.ted.com/graphql with HOME_VIDEOS query.
+    //    Most reliable but returns less metadata than the other approaches.
+    try {
         return new TedTalksHomePager();
+    } catch (error) {
+        logError(`All home pagers failed: ${error.message}`);
+        return createEmptyPager();
     }
 };
 
@@ -266,6 +284,98 @@ class TedTalksHomePager extends ContentPager {
             logError(`Exception in TedTalksHomePager.nextPage: ${error.message}`);
             showToast(`Failed to load TED Talks: ${error.message}`);
             return createEmptyPager();
+        }
+    }
+}
+
+/**
+ * Custom pager that fetches talks from TED's web page (__NEXT_DATA__).
+ * Avoids the zenith-prod-alt.ted.com search API which has SSL renegotiation issues.
+ */
+class TedTalksWebPager extends ContentPager {
+    constructor() {
+        super([], true);
+        this.currentPage = 1;
+        this.hasNextPage = true;
+        this.nextPage();
+    }
+
+    nextPage() {
+        try {
+            const url = `${PLATFORM.TALKS_URL}?sort=newest&page=${this.currentPage}`;
+            // throwOnError: true (default) so constructor failures propagate to getHome cascade
+            const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+
+            if (!response.isOk) {
+                logError(`Web page request failed for talks page ${this.currentPage}. Status: ${response.code}`);
+                this.results = [];
+                this.hasMore = false;
+                return this;
+            }
+
+            const talksData = extractNextDataFromHtml(response.body, 'talks');
+            if (!talksData) {
+                logError('Could not extract talks from __NEXT_DATA__');
+                this.results = [];
+                this.hasMore = false;
+                return this;
+            }
+
+            // talksData is an object with numeric keys ("0", "1", ...) not a standard array
+            // (verified via Playwright browser testing)
+            const talksArray = Array.isArray(talksData)
+                ? talksData
+                : Object.keys(talksData)
+                    .filter(k => !isNaN(k))
+                    .sort((a, b) => parseInt(a) - parseInt(b))
+                    .map(k => talksData[k]);
+
+            if (talksArray.length === 0) {
+                this.results = [];
+                this.hasMore = false;
+                return this;
+            }
+
+            // Normalize the web page format to match what convertToPlatformVideoDetails expects:
+            // - presenterDisplayName -> speakers (as string, handled by extractSpeakerInfo fallback)
+            // - primaryImageSet is already supported by extractThumbnailUrl
+            const normalizedTalks = talksArray.map(talk => ({
+                ...talk,
+                speakers: talk.presenterDisplayName || 'TED'
+            }));
+
+            // Fetch extra metadata (hlsUrl, nativeDownloads, playerData, speakers objects)
+            const slugs = normalizedTalks.map(t => t.slug).filter(Boolean);
+            const extraMetadata = slugs.length > 0 ? (getVideoDetailsBySlugList(slugs) || {}) : {};
+
+            const videos = normalizedTalks
+                .filter(talk => shouldShowContent(talk, extraMetadata[talk.slug] || {}))
+                .map(talk => {
+                    const extra = extraMetadata[talk.slug] || {};
+                    if (hasPlayableVideoSources(talk, extra)) {
+                        return convertToPlatformVideoDetails(talk, extra);
+                    }
+                    return convertToNestedMediaContent(talk, extra);
+                });
+
+            this.currentPage++;
+            // TED returns 24 items per page; if fewer, no more pages
+            this.hasNextPage = talksArray.length >= 24;
+
+            this.results = videos;
+            this.hasMore = this.hasNextPage;
+
+            return this;
+        } catch (error) {
+            logError(`Exception in TedTalksWebPager.nextPage: ${error.message}`);
+            // Re-throw from constructor (first call) so getHome cascade works;
+            // on subsequent nextPage() calls, return empty to stop pagination
+            if (this.currentPage === 1) {
+                throw error;
+            }
+            this.results = [];
+            this.hasMore = false;
+            return this;
         }
     }
 }
@@ -1198,8 +1308,8 @@ function fetchSubtitles(metadataUrl) {
 }
 
 /**
- * Makes an HTTP request with automatic retries and error handling
- * 
+ * Makes an HTTP request with automatic retries and httpimp fallback.
+ *
  * @param {string} method - HTTP method ('GET', 'POST', etc.)
  * @param {string} url - The URL to make the request to
  * @param {string|Object|null} body - Request body for POST/PUT requests
@@ -1207,8 +1317,8 @@ function fetchSubtitles(metadataUrl) {
  * @param {Object} options - Additional options
  * @param {boolean} [options.useAuth=false] - Whether to use authentication for the request
  * @param {boolean} [options.parseResponse=false] - Whether to parse the response as JSON
- * @param {number} [options.maxRetries=3] - Maximum number of retry attempts
- * @param {boolean} [options.throwOnError=false] - Whether to throw an exception on error
+ * @param {number} [options.maxRetries=4] - Maximum number of retry attempts
+ * @param {boolean} [options.throwOnError=true] - Whether to throw an exception on error
  * @returns {Object} - Response object with isOk, code, and body properties
  */
 function makeRequestWithRetry(method, url, body = null, headers = {}, options = {}) {
@@ -1218,92 +1328,126 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
         maxRetries = 4,
         throwOnError = true
     } = options;
-    
-    let remainingAttempts = maxRetries + 1; // +1 for the initial attempt
-    let lastResponse = null;
-    let lastError = null;
-    
-    while (remainingAttempts > 0) {
 
-        try {
-            let response;
-            
-            // Make the appropriate type of request based on method
-            if (method.toUpperCase() === 'GET') {
-                // using object spread due to issue on desktop when modifying the object with response.parsedBody
-                response = {...http.GET(url, headers, useAuth)};
-            } else if (method.toUpperCase() === 'POST') {
-                // using object spread due to issue on desktop when modifying the object with response.parsedBody
-                response = {...http.POST(url, body, headers, useAuth)};
-            } else {
-                throw new ScriptException(`Unsupported HTTP method: ${method}`);
-            }
-            
-            // If request was successful, optionally parse the response
-            if (response.isOk && parseResponse) {
-                try {
-                    
-                    response.parsedBody = JSON.parse(response.body);
-                    
-                    // Check for API error responses that might be in a 200 response
-                    if (response.parsedBody.errors) {
-                        const errorMsg = `API returned error: ${JSON.stringify(response.parsedBody.errors)}`;
-                        logError(errorMsg);
-                        if (throwOnError) {
-                            throw new ScriptException(errorMsg);
-                        }
-                    }
-                } catch (parseError) {
-                    
-                    const errorMsg = `Failed to parse response as JSON: ${parseError.message}`;
+    const useImp = _settings.useBrowserImpersonation !== false && IS_IMPERSONATION_AVAILABLE;
+
+    // Strip User-Agent for httpimp - curl-impersonate sets its own to match TLS fingerprint
+    const impHeaders = Object.fromEntries(
+        Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'user-agent')
+    );
+
+    function executeRequest(client, reqHeaders) {
+        let response;
+        if (method.toUpperCase() === 'GET') {
+            response = {...client.GET(url, reqHeaders, useAuth)};
+        } else if (method.toUpperCase() === 'POST') {
+            response = {...client.POST(url, body, reqHeaders, useAuth)};
+        } else {
+            throw new ScriptException(`Unsupported HTTP method: ${method}`);
+        }
+        return response;
+    }
+
+    function parseResponseBody(response) {
+        if (response.isOk && parseResponse) {
+            try {
+                response.parsedBody = JSON.parse(response.body);
+                if (response.parsedBody.errors) {
+                    const errorMsg = `API returned error: ${JSON.stringify(response.parsedBody.errors)}`;
                     logError(errorMsg);
                     if (throwOnError) {
                         throw new ScriptException(errorMsg);
                     }
                 }
+            } catch (parseError) {
+                // Re-throw ScriptException (API errors) -- these are data-level issues, not transport
+                if (parseError instanceof ScriptException) throw parseError;
+                const errorMsg = `Failed to parse response as JSON: ${parseError.message}`;
+                logError(errorMsg);
+                if (throwOnError) {
+                    throw new ScriptException(errorMsg);
+                }
             }
-            
-            // Return on success
-            if (response.isOk) {
-                return response;
-            }
-            
-            // Save the failed response and log the error
-            lastResponse = response;
-            const errorMsg = `${method} request to ${url} failed with status ${response.code}`;
-            logError(`${errorMsg}. Attempts left: ${remainingAttempts - 1}`);
-            
-            if (throwOnError) {
-                throw new ScriptException(errorMsg);
-            }
-            
-            remainingAttempts--;
-            
-        } catch (error) {
-            // Save the error and log it
-            lastError = error;
-            logError(`Exception in ${method} request to ${url}: ${error.message}. Attempts left: ${remainingAttempts - 1}`);
-            
-            if (throwOnError && remainingAttempts <= 1) {
-                throw error;
-            }
-            
-            remainingAttempts--;
         }
+        return response;
     }
-    
-    // All retry attempts have failed, return last response or construct a dummy response
-    if (lastResponse) {
-        return lastResponse;
+
+    /**
+     * Tries a client with retries. Never throws transport errors -- returns them
+     * as { lastResponse, lastError } to allow the outer cascade to continue.
+     * ScriptExceptions from parseResponseBody ARE re-thrown (data-level errors).
+     */
+    function tryClient(client, label, attempts, reqHeaders) {
+        let lastResponse = null;
+        let lastError = null;
+
+        while (attempts > 0) {
+            try {
+                const response = executeRequest(client, reqHeaders);
+                if (response.isOk) {
+                    // parseResponseBody may throw ScriptException for API/parse errors
+                    // Those are re-thrown intentionally (not transport-level, httpimp won't help)
+                    return parseResponseBody(response);
+                }
+
+                lastResponse = response;
+                logError(`[${label}] ${method} ${url} failed with status ${response.code}. Attempts left: ${attempts - 1}`);
+            } catch (error) {
+                // Re-throw data-level ScriptExceptions immediately (API errors, parse errors)
+                if (error instanceof ScriptException) throw error;
+                lastError = error;
+                logError(`[${label}] Exception in ${method} ${url}: ${error.message}. Attempts left: ${attempts - 1}`);
+            }
+            attempts--;
+        }
+        return { lastResponse, lastError };
     }
-    
-    // Create a dummy response if we don't have a real one
-    return { 
-        isOk: false, 
-        code: 0,
-        status: 0,
-        body: JSON.stringify({ error: lastError ? lastError.message : `${method} request failed after all retry attempts` }) 
-    };
+
+    // Wrap the cascade in try/catch to handle ScriptExceptions from parseResponseBody
+    try {
+        // 1. Try standard http with retries
+        const httpResult = tryClient(http, 'http', maxRetries + 1, headers);
+        if (httpResult.isOk !== undefined) {
+            return httpResult; // Got a valid response
+        }
+
+        // 2. Try httpimp if available (single attempt)
+        if (useImp) {
+            const impResult = tryClient(httpimp, 'httpimp', 1, impHeaders);
+            if (impResult.isOk !== undefined) {
+                return impResult;
+            }
+
+            // Both failed
+            if (throwOnError) {
+                throw impResult.lastError || httpResult.lastError ||
+                    new ScriptException(`${method} request to ${url} failed after all attempts (http + httpimp)`);
+            }
+
+            return impResult.lastResponse || httpResult.lastResponse || {
+                isOk: false, code: 0, status: 0,
+                body: JSON.stringify({ error: `${method} request failed after all retry attempts` })
+            };
+        }
+
+        // httpimp not available - handle http-only failure
+        if (throwOnError) {
+            throw httpResult.lastError ||
+                new ScriptException(`${method} request to ${url} failed after all attempts`);
+        }
+
+        return httpResult.lastResponse || {
+            isOk: false, code: 0, status: 0,
+            body: JSON.stringify({ error: `${method} request failed after all retry attempts` })
+        };
+    } catch (error) {
+        // ScriptExceptions from parseResponseBody bubble up here
+        if (throwOnError) throw error;
+        return {
+            isOk: false, code: 0, status: 0,
+            body: JSON.stringify({ error: error.message })
+        };
+    }
 }
 
 // ====================== CONVERSION FUNCTIONS ======================
