@@ -47,6 +47,13 @@
       "default": "true"
     },
     {
+      "variable": "verboseNotifications",
+      "name": "Verbose notifications",
+      "description": "Show toast notifications for HTTP request details (useful for debugging)",
+      "type": "Boolean",
+      "default": "false"
+    },
+    {
       "variable": "useBrowserImpersonation",
       "name": "Browser Impersonation",
       "description": "Use TLS fingerprint impersonation (HttpImp) to bypass bot detection and SSL issues. Disable if you experience connection problems.",
