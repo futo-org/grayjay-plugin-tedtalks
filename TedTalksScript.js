@@ -99,26 +99,27 @@ source.enable = (conf, settings, saveStateStr) => {
  * @returns {ContentPager} Paged results for home page
  */
 source.getHome = () => {
-    // 1. Web scraping: fetches /talks?sort=newest HTML and parses __NEXT_DATA__.
-    //    All requests go through www.ted.com (no SSL renegotiation issues).
+    // 1. GraphQL: POST to www.ted.com/graphql with HOME_VIDEOS query.
+    //    Reliable, proper cursor-based pagination, no SSL issues.
     try {
-        return new TedTalksWebPager();
+        return new TedTalksHomePager();
     } catch (error) {
-        trace(`WebPager failed: ${error.message}`);
+        trace(`HomePager failed: ${error.message}`);
     }
 
     // 2. Search API: POST to zenith-prod-alt.ted.com/api/search.
-    //    Fast but this endpoint requests SSL/TLS renegotiation which can cause intermittent failures.
+    //    This endpoint requests SSL/TLS renegotiation which can cause intermittent failures.
     try {
         return new TedTalksSearchPager("");
     } catch (error) {
         trace(`SearchPager failed: ${error.message}`);
     }
 
-    // 3. GraphQL: POST to www.ted.com/graphql with HOME_VIDEOS query.
-    //    Most reliable but returns less metadata than the other approaches.
+    // 3. Web scraping: fetches /talks?sort=newest HTML and parses __NEXT_DATA__.
+    //    Last resort. Only returns a single page (no pagination) but works on some devices/networks
+    //    where the other approaches fail.
     try {
-        return new TedTalksHomePager();
+        return new TedTalksWebPager();
     } catch (error) {
         trace(`All home pagers failed: ${error.message}`);
         return createEmptyPager();
@@ -230,7 +231,6 @@ class TedTalksHomePager extends ContentPager {
     constructor() {
         super([], true);
         this.cursor = "0";
-        this.hasNextPage = true;
         this.nextPage();
     }
 
@@ -244,23 +244,25 @@ class TedTalksHomePager extends ContentPager {
                 query: GQL_QUERIES.HOME_VIDEOS,
                 variables: {
                     first: 20,
-                    after: this.cursor,
-                    isPublished: true
+                    after: this.cursor
                 }
             };
 
-            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
+            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
 
             if (!response.isOk) {
-                trace(`GraphQL request failed for home videos. Status: ${response.status}`);
-                trace(`Failed to load TED Talks. Please try again later.`);
-                return createEmptyPager();
+                trace(`GraphQL request failed for home videos. Status: ${response.code}`);
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             const responseData = safeJsonParse(response.body);
             if (!responseData?.data?.videos?.nodes) {
                 trace('Invalid response format for home videos');
-                return createEmptyPager();
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             // Extract video data, filtering out podcast-only content (unless external content handling is "Show")
@@ -274,42 +276,40 @@ class TedTalksHomePager extends ContentPager {
                 });
 
             // Update pagination info
-            this.hasNextPage = responseData.data.videos.pageInfo.hasNextPage;
             this.cursor = responseData.data.videos.pageInfo.endCursor;
 
             // Update results
             this.results = videos;
-            this.hasMore = this.hasNextPage;
+            this.hasMore = responseData.data.videos.pageInfo.hasNextPage;
 
             return this;
         } catch (error) {
             trace(`Exception in TedTalksHomePager.nextPage: ${error.message}`);
-            trace(`Failed to load TED Talks: ${error.message}`);
-            return createEmptyPager();
+            this.results = [];
+            this.hasMore = false;
+            return this;
         }
     }
 }
 
 /**
- * Custom pager that fetches talks from TED's web page (__NEXT_DATA__).
- * Avoids the zenith-prod-alt.ted.com search API which has SSL renegotiation issues.
+ * Last resort pager that fetches talks from TED's web page (__NEXT_DATA__).
+ * Returns a single page only (TED's __NEXT_DATA__ ignores the page parameter).
+ * Used when both GraphQL and Search API fail on some devices/networks.
  */
 class TedTalksWebPager extends ContentPager {
     constructor() {
         super([], true);
-        this.currentPage = 1;
-        this.hasNextPage = true;
         this.nextPage();
     }
 
     nextPage() {
         try {
-            const url = `${PLATFORM.TALKS_URL}?sort=newest&page=${this.currentPage}`;
-            // throwOnError: true (default) so constructor failures propagate to getHome cascade
+            const url = `${PLATFORM.TALKS_URL}?sort=newest`;
             const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
 
             if (!response.isOk) {
-                trace(`Web page request failed for talks page ${this.currentPage}. Status: ${response.code}`);
+                trace(`Web page request failed. Status: ${response.code}`);
                 this.results = [];
                 this.hasMore = false;
                 return this;
@@ -360,24 +360,13 @@ class TedTalksWebPager extends ContentPager {
                     return convertToNestedMediaContent(talk, extra);
                 });
 
-            this.currentPage++;
-            // TED returns 24 items per page; if fewer, no more pages
-            this.hasNextPage = talksArray.length >= 24;
-
             this.results = videos;
-            this.hasMore = this.hasNextPage;
+            this.hasMore = false;
 
             return this;
         } catch (error) {
             trace(`Exception in TedTalksWebPager.nextPage: ${error.message}`);
-            // Re-throw from constructor (first call) so getHome cascade works;
-            // on subsequent nextPage() calls, return empty to stop pagination
-            if (this.currentPage === 1) {
-                throw error;
-            }
-            this.results = [];
-            this.hasMore = false;
-            return this;
+            throw error;
         }
     }
 }
@@ -417,23 +406,28 @@ class TedTalksSearchPager extends ContentPager {
             };
 
             const request = [{ "indexName": "newest", "params": searchParams }];
-            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS, { parseResponse: true });
+            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS);
 
             if (!response.isOk) {
-                trace(`Search API request failed. Status: ${response.status}, Query: "${this.query}", Page: ${this.currentPage}`);
-                trace(`Failed to load TED Talks. Please try again later.`);
-                return createEmptyPager();
+                trace(`Search API request failed. Status: ${response.code}, Query: "${this.query}", Page: ${this.currentPage}`);
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             const searchResults = safeJsonParse(response.body)?.results?.[0];
             if (!searchResults?.hits) {
                 trace(`Invalid search response format for query: "${this.query}", Page: ${this.currentPage}`);
-                return createEmptyPager();
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             const hits = searchResults.hits;
             if (hits.length === 0) {
-                return createEmptyPager();
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             // Get additional metadata for the videos
@@ -467,8 +461,9 @@ class TedTalksSearchPager extends ContentPager {
             return this;
         } catch (error) {
             trace(`Exception in TedTalksSearchPager.nextPage: ${error.message}`);
-            trace(`Failed to load TED Talks: ${error.message}`);
-            return createEmptyPager();
+            this.results = [];
+            this.hasMore = false;
+            return this;
         }
     }
 }
@@ -511,23 +506,28 @@ class TedTalksTopicPager extends ContentPager {
             };
 
             const request = [{ "indexName": "newest", "params": searchParams }];
-            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS, { parseResponse: true });
+            const response = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(request), DEFAULT_HEADERS);
 
             if (!response.isOk) {
-                trace(`Search API request failed for topic. Status: ${response.status}, Topic: "${this.topicSlug}", Page: ${this.currentPage}`);
-                trace(`Failed to load topic videos. Please try again later.`);
-                return createEmptyPager();
+                trace(`Search API request failed for topic. Status: ${response.code}, Topic: "${this.topicSlug}", Page: ${this.currentPage}`);
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             const searchResults = safeJsonParse(response.body)?.results?.[0];
             if (!searchResults?.hits) {
                 trace(`Invalid search response format for topic: "${this.topicSlug}", Page: ${this.currentPage}`);
-                return createEmptyPager();
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             const hits = searchResults.hits;
             if (hits.length === 0) {
-                return createEmptyPager();
+                this.results = [];
+                this.hasMore = false;
+                return this;
             }
 
             // Get additional metadata for the videos
@@ -561,8 +561,9 @@ class TedTalksTopicPager extends ContentPager {
             return this;
         } catch (error) {
             trace(`Exception in TedTalksTopicPager.nextPage: ${error.message}`);
-            trace(`Failed to load topic videos: ${error.message}`);
-            return createEmptyPager();
+            this.results = [];
+            this.hasMore = false;
+            return this;
         }
     }
 }
@@ -579,7 +580,7 @@ function searchSpeakers(query) {
     const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
 
     if (!response.isOk) {
-        trace(`Failed to get speakers search page. Status: ${response.status}, URL: ${url}`);
+        trace(`Failed to get speakers search page. Status: ${response.code}, URL: ${url}`);
         trace('Failed to load speaker search results.');
         return createEmptyPager();
     }
@@ -687,7 +688,7 @@ function getPlaylistByUrl(url) {
         // Fetch the playlist page to get data from __NEXT_DATA__
         const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
         if (!response.isOk) {
-            trace(`Failed to get playlist page. Status: ${response.status}, URL: ${url}`);
+            trace(`Failed to get playlist page. Status: ${response.code}, URL: ${url}`);
             trace('Failed to load playlist.');
             return null;
         }
@@ -799,7 +800,7 @@ function getTopicInfo(topicSlug) {
             variables: { slug: topicSlug }
         };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true, throwOnError: false });
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { throwOnError: false });
 
         if (!response.isOk) {
             return null;
@@ -983,7 +984,7 @@ function getChannelContentsByUrl(url) {
         // Fetch the speaker page (don't throw on error, handle gracefully)
         const response = makeRequestWithRetry('GET', cleanUrl, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
         if (!response.isOk) {
-            trace(`Failed to get channel page. Status: ${response.status}, URL: ${cleanUrl}`);
+            trace(`Failed to get channel page. Status: ${response.code}, URL: ${cleanUrl}`);
             trace('Speaker does not have a profile page yet.', { showToast: true });
             return createEmptyPager();
         }
@@ -1088,7 +1089,7 @@ function getChannelByHTML(url) {
 
     const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
     if (!response.isOk) {
-        trace(`Failed to get channel page. Status: ${response.status}, URL: ${url}`);
+        trace(`Failed to get channel page. Status: ${response.code}, URL: ${url}`);
         trace('Speaker profile not found. This TED speaker may not have a public profile yet.', { showToast: true });
         throw new UnavailableException("Not able to access speaker page.");
     }
@@ -1227,10 +1228,10 @@ function makeGraphQLRequest(queryName, variables, operationName) {
             variables: variables
         };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS, { parseResponse: true });
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(queryInfo), DEFAULT_HEADERS);
 
         if (!response.isOk) {
-            trace(`GraphQL request failed. Query: ${queryName}, Status: ${response.status}`);
+            trace(`GraphQL request failed. Query: ${queryName}, Status: ${response.code}`);
             return null;
         }
 
@@ -1255,7 +1256,7 @@ function getVideoDetailsBySlugList(slugs) {
             }
         };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { parseResponse: true, throwOnError: false });
+        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { throwOnError: false });
 
         if (!response.isOk) {
             return {};
@@ -1284,9 +1285,9 @@ function getVideoDetailsBySlugList(slugs) {
  */
 function fetchSubtitles(metadataUrl) {
     try {
-        const response = makeRequestWithRetry('GET', metadataUrl, null, {}, { parseResponse: true });
+        const response = makeRequestWithRetry('GET', metadataUrl, null, {});
         if (!response.isOk) {
-            trace(`Subtitle request failed: ${response.status}`);
+            trace(`Subtitle request failed: ${response.code}`);
             return [];
         }
         
@@ -1318,7 +1319,6 @@ function fetchSubtitles(metadataUrl) {
  * @param {Object} headers - HTTP headers for the request
  * @param {Object} options - Additional options
  * @param {boolean} [options.useAuth=false] - Whether to use authentication for the request
- * @param {boolean} [options.parseResponse=false] - Whether to parse the response as JSON
  * @param {number} [options.maxRetries=1] - Maximum number of retry attempts
  * @param {boolean} [options.throwOnError=true] - Whether to throw an exception on error
  * @returns {Object} - Response object with isOk, code, and body properties
@@ -1326,7 +1326,6 @@ function fetchSubtitles(metadataUrl) {
 function makeRequestWithRetry(method, url, body = null, headers = {}, options = {}) {
     const {
         useAuth = false,
-        parseResponse = false,
         maxRetries = 1,
         throwOnError = true
     } = options;
@@ -1350,35 +1349,6 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
         return response;
     }
 
-    function parseResponseBody(response) {
-        if (response.isOk && parseResponse) {
-            try {
-                response.parsedBody = JSON.parse(response.body);
-                if (response.parsedBody.errors) {
-                    const errorMsg = `API returned error: ${JSON.stringify(response.parsedBody.errors)}`;
-                    trace(errorMsg);
-                    if (throwOnError) {
-                        throw new ScriptException(errorMsg);
-                    }
-                }
-            } catch (parseError) {
-                // Re-throw ScriptException (API errors) -- these are data-level issues, not transport
-                if (parseError instanceof ScriptException) throw parseError;
-                const errorMsg = `Failed to parse response as JSON: ${parseError.message}`;
-                trace(errorMsg);
-                if (throwOnError) {
-                    throw new ScriptException(errorMsg);
-                }
-            }
-        }
-        return response;
-    }
-
-    /**
-     * Tries a client with retries. Never throws transport errors -- returns them
-     * as { lastResponse, lastError } to allow the outer cascade to continue.
-     * ScriptExceptions from parseResponseBody ARE re-thrown (data-level errors).
-     */
     function tryClient(client, label, attempts, reqHeaders) {
         let lastResponse = null;
         let lastError = null;
@@ -1388,16 +1358,12 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
                 const response = executeRequest(client, reqHeaders);
                 if (response.isOk) {
                     trace(`[${label}] OK: ${method} ${url}`);
-                    // parseResponseBody may throw ScriptException for API/parse errors
-                    // Those are re-thrown intentionally (not transport-level, httpimp won't help)
-                    return parseResponseBody(response);
+                    return response;
                 }
 
                 lastResponse = response;
                 trace(`[${label}] ${method} ${url} failed with status ${response.code}. Attempts left: ${attempts - 1}`);
             } catch (error) {
-                // Re-throw data-level ScriptExceptions immediately (API errors, parse errors)
-                if (error instanceof ScriptException) throw error;
                 lastError = error;
                 trace(`[${label}] Exception in ${method} ${url}: ${error.message}. Attempts left: ${attempts - 1}`);
             }
@@ -1406,51 +1372,41 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
         return { lastResponse, lastError };
     }
 
-    // Wrap the cascade in try/catch to handle ScriptExceptions from parseResponseBody
-    try {
-        // 1. Try standard http with retries
-        const httpResult = tryClient(http, 'http', maxRetries + 1, headers);
-        if (httpResult.isOk !== undefined) {
-            return httpResult; // Got a valid response
+    // 1. Try standard http with retries
+    const httpResult = tryClient(http, 'http', maxRetries + 1, headers);
+    if (httpResult.isOk !== undefined) {
+        return httpResult;
+    }
+
+    // 2. Try httpimp if available (single attempt)
+    if (useImp) {
+        const impResult = tryClient(httpimp, 'httpimp', 1, impHeaders);
+        if (impResult.isOk !== undefined) {
+            return impResult;
         }
 
-        // 2. Try httpimp if available (single attempt)
-        if (useImp) {
-            const impResult = tryClient(httpimp, 'httpimp', 1, impHeaders);
-            if (impResult.isOk !== undefined) {
-                return impResult;
-            }
-
-            // Both failed
-            if (throwOnError) {
-                throw impResult.lastError || httpResult.lastError ||
-                    new ScriptException(`${method} request to ${url} failed after all attempts (http + httpimp)`);
-            }
-
-            return impResult.lastResponse || httpResult.lastResponse || {
-                isOk: false, code: 0, status: 0,
-                body: JSON.stringify({ error: `${method} request failed after all retry attempts` })
-            };
-        }
-
-        // httpimp not available - handle http-only failure
+        // Both failed
         if (throwOnError) {
-            throw httpResult.lastError ||
-                new ScriptException(`${method} request to ${url} failed after all attempts`);
+            throw impResult.lastError || httpResult.lastError ||
+                new ScriptException(`${method} request to ${url} failed after all attempts (http + httpimp)`);
         }
 
-        return httpResult.lastResponse || {
-            isOk: false, code: 0, status: 0,
+        return impResult.lastResponse || httpResult.lastResponse || {
+            isOk: false, code: 0,
             body: JSON.stringify({ error: `${method} request failed after all retry attempts` })
         };
-    } catch (error) {
-        // ScriptExceptions from parseResponseBody bubble up here
-        if (throwOnError) throw error;
-        return {
-            isOk: false, code: 0, status: 0,
-            body: JSON.stringify({ error: error.message })
-        };
     }
+
+    // httpimp not available - handle http-only failure
+    if (throwOnError) {
+        throw httpResult.lastError ||
+            new ScriptException(`${method} request to ${url} failed after all attempts`);
+    }
+
+    return httpResult.lastResponse || {
+        isOk: false, code: 0,
+        body: JSON.stringify({ error: `${method} request failed after all retry attempts` })
+    };
 }
 
 // ====================== CONVERSION FUNCTIONS ======================
@@ -1462,7 +1418,8 @@ function mapSource(source, key, duration) {
             new HLSSource({
                 name: key,
                 url: source.stream,
-                duration: duration
+                duration: duration,
+                priority: true,
             }),
         );
     } else if (REGEX.MPEG_URL.test(source.file)) {
@@ -1477,7 +1434,7 @@ function mapSource(source, key, duration) {
     }
 
     return sources;
-}
+} 
 
 /**
  * Checks if a video has playable sources nativelly in TED platform. This excluded content hosted on external platforms such as YouTube.
@@ -1831,7 +1788,7 @@ function createAuthorLink(speaker) {
  */
 function createVideoSources(video) {
     const videoSources = [];
-    
+
     const duration = safeParseInt(video.duration);
 
     // Add HLS source if available
@@ -1840,7 +1797,8 @@ function createVideoSources(video) {
             new HLSSource({
                 name: 'HLS',
                 url: video.hlsUrl,
-                duration: duration
+                duration: duration,
+                priority: true
             })
         );
     }
@@ -1879,7 +1837,7 @@ function createVideoSources(video) {
             new VideoUrlSource({
                 name: VIDEO_QUALITY.HIGH.name,
                 duration: duration,
-                url: video?.nativeDownloads?.medium,
+                url: video?.nativeDownloads?.high,
                 width: VIDEO_QUALITY.HIGH.width,
                 height: VIDEO_QUALITY.HIGH.height,
                 container: "video/mp4"
@@ -1887,12 +1845,12 @@ function createVideoSources(video) {
         );
     }
 
-    const playerData = video?.playerData;
+    const playerDataStr = video?.playerData;
 
-    if (!videoSources.length && playerData) {
+    if (!videoSources.length && playerDataStr) {
 
         try {
-            const playerData = safeJsonParse(playerData);
+            const playerData = safeJsonParse(playerDataStr);
             if (playerData?.resources) {
                 for (let key in playerData.resources) {
                     const sourceType = playerData.resources[key];
@@ -1910,18 +1868,18 @@ function createVideoSources(video) {
         }
     }
 
-    // Audio source has diferent duration, and includes some narration in the beginning. Could be used in an audio only mode
-    // if(video.audioDownload){
-    //     audioSources.push(
-    //         new AudioUrlSource({
-    //             name: "audio/mp3",
-    //             duration: duration,
-    //             url: video.audioDownload,
-    //             container: "audio/mp3"
-    //         })
-    //     );
-    // }
-
+    // Audio source has diferent duration, and includes some narration in the beginning. Could be used in an audio only mode 
+    // if(video.audioDownload){ 
+    //     audioSources.push( 
+    //         new AudioUrlSource({ 
+    //             name: "audio/mp3", 
+    //             duration: duration, 
+    //             url: video.audioDownload, 
+    //             container: "audio/mp3" 
+    //         }) 
+    //     ); 
+    // } 
+ 
     return new VideoSourceDescriptor(videoSources);
 }
 
