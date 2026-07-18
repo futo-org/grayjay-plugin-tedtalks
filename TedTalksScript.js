@@ -29,7 +29,9 @@ const REGEX = {
     SPEAKER_ID: /speakerId=(\d+)/,
     TALK_SLUG: /ted\.com\/talks\/([^?#]+)/i,
     HLS_URL: /https:\/\/.*\.m3u8/i,
-    MPEG_URL: /https:\/\/.*\.mp4/i
+    MPEG_URL: /https:\/\/.*\.mp4/i,
+    HLS_PROJECT_ID: /project_masters\/(\d+)\//i,
+    HLS_INTRO_ID: /intro_master_id=(\d+)/i
 };
 
 // Default request headers for TED API
@@ -63,13 +65,22 @@ let config = {};
 
 // Plugin settings storage
 let _settings = {
-    showExternalContent: false,
+    showExternalContent: true,
     useBrowserImpersonation: true,
     verboseNotifications: false
 };
 
 const IS_ANDROID = bridge.buildPlatform === "android";
 const IS_DESKTOP = bridge.buildPlatform === "desktop";
+
+// Android intercepts any plugin_type ending in "Details" inside JSContentPager feeds
+// (IJSContent.fromV8) and VideoDetailFragment reuses it without calling getContentDetails.
+// It advertises no capability for this, so the platform itself is the signal.
+const DETAILS_IN_FEED_ANDROID = true;
+// Desktop reuses feed details only once its pagers stamp a refPager BackendUrl, and it
+// advertises no capability to detect that, so this stays off until a version floor exists.
+const DETAILS_IN_FEED_DESKTOP = false;
+const DETAILS_IN_FEED = IS_DESKTOP ? DETAILS_IN_FEED_DESKTOP : DETAILS_IN_FEED_ANDROID;
 
 const IMPERSONATION_TARGET = IS_DESKTOP ? 'chrome136' : 'chrome131_android';
 const IS_IMPERSONATION_AVAILABLE = (typeof httpimp !== 'undefined');
@@ -270,7 +281,7 @@ class TedTalksHomePager extends ContentPager {
                 .filter(video => shouldShowContent(video, {}))
                 .map(video => {
                     if (hasPlayableVideoSources(video, {})) {
-                        return convertToPlatformVideoDetails(video, {});
+                        return convertToFeedItem(video, {});
                     }
                     return convertToNestedMediaContent(video, {});
                 });
@@ -338,7 +349,7 @@ class TedTalksWebPager extends ContentPager {
                 return this;
             }
 
-            // Normalize the web page format to match what convertToPlatformVideoDetails expects:
+            // Normalize the web page format to match what convertToFeedItem expects:
             // - presenterDisplayName -> speakers (as string, handled by extractSpeakerInfo fallback)
             // - primaryImageSet is already supported by extractThumbnailUrl
             const normalizedTalks = talksArray.map(talk => ({
@@ -355,7 +366,7 @@ class TedTalksWebPager extends ContentPager {
                 .map(talk => {
                     const extra = extraMetadata[talk.slug] || {};
                     if (hasPlayableVideoSources(talk, extra)) {
-                        return convertToPlatformVideoDetails(talk, extra);
+                        return convertToFeedItem(talk, extra);
                     }
                     return convertToNestedMediaContent(talk, extra);
                 });
@@ -440,7 +451,7 @@ class TedTalksSearchPager extends ContentPager {
                 .map(hit => {
                     const extra = extraMetadata[hit.slug] || {};
                     if (hasPlayableVideoSources(hit, extra)) {
-                        return convertToPlatformVideoDetails(hit, extra);
+                        return convertToFeedItem(hit, extra);
                     }
                     return convertToNestedMediaContent(hit, extra);
                 });
@@ -540,7 +551,7 @@ class TedTalksTopicPager extends ContentPager {
                 .map(hit => {
                     const extra = extraMetadata[hit.slug] || {};
                     if (hasPlayableVideoSources(hit, extra)) {
-                        return convertToPlatformVideoDetails(hit, extra);
+                        return convertToFeedItem(hit, extra);
                     }
                     return convertToNestedMediaContent(hit, extra);
                 });
@@ -659,7 +670,7 @@ function getVideoRecommendations(url, relatedVideos) {
             .map(relatedVideo => {
                 const extra = metaSet[relatedVideo.slug];
                 if (hasPlayableVideoSources(relatedVideo, extra)) {
-                    return convertToPlatformVideoDetails(relatedVideo, extra);
+                    return convertToFeedItem(relatedVideo, extra);
                 }
                 return convertToNestedMediaContent(relatedVideo, extra);
             });
@@ -932,7 +943,7 @@ function convertPlaylistVideoToPlatformVideo(video, extraData) {
     );
 
     return new PlatformVideo({
-        id: new PlatformID(PLATFORM.NAME, video.id || slug, config.id),
+        id: new PlatformID(PLATFORM.NAME, video.canonicalUrl || extraData?.canonicalUrl || slug || video.id, config.id),
         name: video.title || 'Unknown TED Talk',
         thumbnails: new Thumbnails(thumbnailUrl ? [new Thumbnail(thumbnailUrl, 0)] : []),
         author: author,
@@ -1012,7 +1023,7 @@ function getChannelContentsByUrl(url) {
                     video.speakers.nodes = video.speakers.nodes.filter(s => s.slug === channelSlug);
                 }
                 if (hasPlayableVideoSources(video, {})) {
-                    return convertToPlatformVideoDetails(video, {});
+                    return convertToFeedItem(video, {});
                 }
                 return convertToNestedMediaContent(video, {});
             });
@@ -1276,6 +1287,36 @@ function getVideoDetailsBySlugList(slugs) {
         trace(`Exception in getVideoDetailsBySlugList: ${error.message}`);
         return {};
     }
+}
+
+/**
+ * Builds subtitle sources from playerData without any HTTP request.
+ * playerData.languages already lists exactly the languages metadata.json reports, and the
+ * webvtt URLs are derivable from the master ids, so feeds avoid a request per item.
+ * @param {Object} playerData Parsed playerData object
+ * @returns {Array<SubtitleSource>|null} Subtitle sources, empty when the talk has none,
+ *   or null when they exist but could not be derived so the caller can fall back
+ */
+function deriveSubtitles(playerData) {
+    const languages = playerData?.languages;
+    if (!Array.isArray(languages) || !languages.length) {
+        return [];
+    }
+
+    const stream = playerData?.resources?.hls?.stream;
+    const projectId = stream?.match(REGEX.HLS_PROJECT_ID)?.[1];
+    const introId = stream?.match(REGEX.HLS_INTRO_ID)?.[1];
+    if (!projectId || !introId) {
+        return null;
+    }
+
+    return languages
+        .filter(language => language?.languageCode)
+        .map(language => ({
+            format: "text/vtt",
+            url: `https://hls.ted.com/project_masters/${projectId}/subtitles/${language.languageCode}/full.vtt?intro_master_id=${introId}&preview=`,
+            name: language.languageName || language.endonym || 'Unknown'
+        }));
 }
 
 /**
@@ -1580,7 +1621,7 @@ function convertToNestedMediaContent(videoData, extraData) {
     const thumbnailSources = thumbnailUrl ? [new Thumbnail(thumbnailUrl, 1)] : [];
     
     return new PlatformNestedMediaContent({
-        id: new PlatformID(PLATFORM.NAME, videoData.canonicalUrl || slug, config.id),
+        id: new PlatformID(PLATFORM.NAME, videoData.canonicalUrl || extraData?.canonicalUrl || slug, config.id),
         name: videoData.title || 'Unknown TED Talk',
         author: author,
         datetime: dateToUnixSeconds(publishedAt),
@@ -1594,13 +1635,15 @@ function convertToNestedMediaContent(videoData, extraData) {
 }
 
 /**
- * Converts TED Talk video data to platform-specific video format
+ * Converts TED Talk video data to a feed item.
+ * Returns a complete PlatformVideoDetails where the client reuses feed details and skips
+ * getContentDetails, otherwise a lightweight PlatformVideo. See DETAILS_IN_FEED.
  * @param {Object} videoData TED Talk video data
  * @param {Object} [extraData] Extra metadata for the video
- * @returns {PlatformVideo} Formatted platform video object
+ * @returns {PlatformVideo|PlatformVideoDetails} Formatted platform video object
  * @throws {ScriptException} If videoData is invalid or missing required properties
  */
-function convertToPlatformVideoDetails(videoData, extraData) {
+function convertToFeedItem(videoData, extraData) {
 
     if (!videoData || typeof videoData !== 'object') {
         throw new ScriptException('Invalid videoData: Expected an object');
@@ -1639,6 +1682,24 @@ function convertToPlatformVideoDetails(videoData, extraData) {
        trace('No thumbnails found for video');
     }
     
+    const base = {
+        id: new PlatformID(PLATFORM.NAME, videoData.canonicalUrl || extraData?.canonicalUrl || slug || 'unknown', config.id),
+        name: videoData.title || 'Unknown TED Talk',
+        thumbnails: new Thumbnails(thumbnails),
+        duration: duration,
+        viewCount: viewedCount,
+        url: videoUrl,
+        uploadDate: dateToUnixSeconds(publishedAt),
+        shareUrl: videoUrl,
+        author: author
+    };
+
+    // Clients that do not reuse feed details call getContentDetails on open, so a lightweight
+    // item is enough and avoids building sources for rows that may never be opened.
+    if (!DETAILS_IN_FEED) {
+        return new PlatformVideo(base);
+    }
+
     // Merge videoData and extraData for video sources - extraData contains hlsUrl from GraphQL
     const mergedVideoData = {
         ...videoData,
@@ -1646,32 +1707,22 @@ function convertToPlatformVideoDetails(videoData, extraData) {
         nativeDownloads: videoData.nativeDownloads || extraData?.nativeDownloads,
         playerData: videoData.playerData || extraData?.playerData
     };
-    
+
+    // The client reuses this object verbatim and never calls getContentDetails for it, so an
+    // incomplete one is unrecoverable. Fall back to a lightweight item instead of shipping one.
+    const playerData = mergedVideoData.playerData ? safeJsonParse(mergedVideoData.playerData) : null;
+    const subtitles = deriveSubtitles(playerData);
+    if (!playerData || subtitles === null) {
+        return new PlatformVideo(base);
+    }
+
     // Build description with topic links
     const topics = videoData.topics?.nodes || extraData?.topics?.nodes || [];
     const description = buildDescriptionWithTopics(videoData.description || extraData?.description || '', topics);
-    
-    // Fetch subtitles if playerData is available
-    let subtitles = [];
-    if (mergedVideoData.playerData) {
-        const playerData = safeJsonParse(mergedVideoData.playerData);
-        const metadataUrl = playerData?.resources?.hls?.metadata;
-        if (metadataUrl) {
-            subtitles = fetchSubtitles(metadataUrl);
-        }
-    }
-    
+
     const details = new PlatformVideoDetails({
-        id: new PlatformID(PLATFORM.NAME, slug || 'unknown', config.id),
-        name: videoData.title || 'Unknown TED Talk',
-        thumbnails: new Thumbnails(thumbnails),
+        ...base,
         description: description,
-        duration: duration,
-        viewCount: viewedCount,
-        url: videoUrl,
-        uploadDate: dateToUnixSeconds(publishedAt),
-        shareUrl: videoUrl,
-        author: author,
         video: createVideoSources(mergedVideoData),
         subtitles: subtitles
     });
