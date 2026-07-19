@@ -7,7 +7,7 @@
   "sourceUrl": "https://plugins.grayjay.app/TedTalks/TedTalksConfig.json",
   "scriptUrl": "./TedTalksScript.js",
   "repositoryUrl": "https://gitlab.futo.org/videostreaming/plugins/tedtalks",
-  "version": 5,
+  "version": 6,
   "iconUrl": "./TedTalksIcon.png",
   "id": "8d029a7f-5507-4e36-8bd8-c19a3b77d383",
   "scriptSignature": "",
@@ -15,6 +15,19 @@
   "maxDownloadParallelism": 1,
   "subscriptionRateLimit": 10,
   "changelog": {
+    "6": [
+      "Fix: Some speakers showing no talks;",
+      "Fix: Missing talks on speakers with more than 50 talks;",
+      "Fix: Missing space in speaker names when searching creators;",
+      "Fix: Unclear error when opening an unavailable talk or playlist;",
+      "Fix: Internal error when opening a speaker without a public profile;",
+      "Fix: Empty Home feed when TED is partly unreachable;",
+      "Fix: Temporary errors shown as if a talk or speaker was removed;",
+      "Fix: Talks wrongly shown as external content when TED is briefly unreachable;",
+      "Fix: Playlist talks not linking to their speaker, and showing a generic image;",
+      "Performance: Faster Home loading;",
+      "Performance: Faster opening of speakers without a public profile;"
+    ],
     "5": [
       "Fix: Home tab pagination;",
       "Improvement: Set HLS as priority source;"
