@@ -60,6 +60,25 @@ const VIDEO_QUALITY = {
     }
 };
 
+// Hits requested when recovering a speaker's talks from the search index (API caps this at 24)
+const SPEAKER_TALKS_SEARCH_LIMIT = 24;
+
+// Bounds the fallback search so an ambiguous speaker name cannot walk the whole index
+const SPEAKER_TALKS_MAX_PAGES = 5;
+
+// Client errors that are worth another attempt: a timeout or an early-data rejection can succeed
+// on retry, and 429 is paced. 429 is a safety net only: ~6000 requests at up to 100 concurrency
+// never produced one, since a CDN absorbs the load ahead of TED's origin.
+const HTTP_TOO_MANY_REQUESTS = 429;
+const HTTP_RETRYABLE_CLIENT_ERRORS = [408, 425, HTTP_TOO_MANY_REQUESTS];
+const HTTP_RETRY_BASE_DELAY_MS = 1000;
+
+// Bot blocking presents as 403, which a different TLS fingerprint can clear
+const HTTP_FORBIDDEN = 403;
+
+// VIDEOS_INFO_BY_SLUG returns at most this many nodes per request
+const VIDEO_DETAILS_BATCH_SIZE = 50;
+
 // Plugin configuration storage
 let config = {};
 
@@ -602,7 +621,15 @@ function searchSpeakers(query) {
             .querySelectorAll('div#browse-results .col');
 
         const channels = Array.from(speakerElements).map(element => {
-            const name = element.querySelector('div.media__message h4')?.text;
+            // The name is split across a <br> (\nAaron<br>Bastani), which .text would join
+            // without a separator, so read the markup and turn the break into a space.
+            const nameHtml = element.querySelector('div.media__message h4')?.innerHTML || '';
+            const name = nameHtml
+                .replace(/<br\s*\/?>/gi, ' ')
+                .replace(/<[^>]+>/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
             const photoUrl = element.querySelector('img.thumb__image')?.getAttribute('src');
             const profileRelativeUrl = element.querySelector('a.results__result')?.getAttribute('href');
             const profileUrl = profileRelativeUrl ? `${PLATFORM.BASE_URL}${profileRelativeUrl}` : '';
@@ -691,25 +718,22 @@ function getPlaylistByUrl(url) {
     try {
         const { id, slug } = extractPlaylistIdAndSlug(url);
         if (!id) {
-            trace(`Could not extract playlist ID from URL: ${url}`);
-            trace('Could not determine playlist from URL.');
-            return null;
+            // Returning null here would surface as an engine cast error rather than a clean message
+            throw new UnavailableException('Could not determine playlist from URL.');
         }
 
         // Fetch the playlist page to get data from __NEXT_DATA__
-        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] });
+        const response = makeRequestWithRetry('GET', url, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
         if (!response.isOk) {
             trace(`Failed to get playlist page. Status: ${response.code}, URL: ${url}`);
-            trace('Failed to load playlist.');
-            return null;
+            throw new UnavailableException('This playlist is unavailable.');
         }
 
         // Extract playlist data from __NEXT_DATA__
         const playlistData = extractNextDataFromHtml(response.body, 'playlist');
         if (!playlistData) {
             trace(`Could not extract playlist data from page: ${url}`);
-            trace('Failed to parse playlist data.');
-            return null;
+            throw new UnavailableException('This playlist could not be read.');
         }
 
         // Get thumbnail from primaryImageSet
@@ -750,8 +774,13 @@ function getPlaylistByUrl(url) {
         });
     } catch (error) {
         trace(`Exception in getPlaylistByUrl: ${error.message}`);
-        trace('Failed to load playlist.');
-        return null;
+
+        if (error instanceof UnavailableException) {
+            throw error;
+        }
+
+        // The caller is source.getPlaylist, whose result must be an object
+        throw new ScriptException(`Could not load this playlist: ${error.message}`);
     }
 }
 
@@ -764,9 +793,8 @@ function getTopicAsPlaylist(url) {
     try {
         const topicSlug = extractTopicSlug(url);
         if (!topicSlug) {
-            trace(`Could not extract topic slug from URL: ${url}`);
-            trace('Could not determine topic from URL.');
-            return null;
+            // Returning null here would surface as an engine cast error rather than a clean message
+            throw new UnavailableException('Could not determine topic from URL.');
         }
 
         // Get topic info from GraphQL
@@ -793,8 +821,13 @@ function getTopicAsPlaylist(url) {
         });
     } catch (error) {
         trace(`Exception in getTopicAsPlaylist: ${error.message}`);
-        trace('Failed to load topic.');
-        return null;
+
+        if (error instanceof UnavailableException) {
+            throw error;
+        }
+
+        // The caller is source.getPlaylist, whose result must be an object
+        throw new ScriptException(`Could not load this topic: ${error.message}`);
     }
 }
 
@@ -994,15 +1027,56 @@ function getChannelContentsByUrl(url) {
 
         // Fetch the speaker page (don't throw on error, handle gracefully)
         const response = makeRequestWithRetry('GET', cleanUrl, null, { 'User-Agent': DEFAULT_HEADERS["User-Agent"] }, { throwOnError: false });
-        if (!response.isOk) {
-            trace(`Failed to get channel page. Status: ${response.code}, URL: ${cleanUrl}`);
-            trace('Speaker does not have a profile page yet.', { showToast: true });
-            return createEmptyPager();
+
+        let talkSlugs = [];
+        let verifyBySpeakerSlug = false;
+        let speakerNameTokens = [];
+        if (response.isOk) {
+            talkSlugs = extractTalkSlugsFromHtml(response.body) || [];
+        } else {
+            // Many speakers have no profile page even though their talks exist, so fall back to
+            // the search index. Match on the speaker name it reports rather than the talk slug,
+            // because the slug may name a co-speaker first or differ from the speaker slug
+            // (jennifer_golbeck vs "Jen Golbeck").
+            trace(`Speaker page unavailable. Status: ${response.code}, URL: ${cleanUrl}`);
+
+            // Some speaker slugs carry an event suffix (lisa_monteggia_TEDxNashvilleWomen20250821-64681).
+            // Those tokens are not part of the name and stop the search from matching.
+            const speakerId = extractSpeakerId(url);
+            const nameTokens = channelSlug.split('_').filter(token => token && !/\d/.test(token));
+            let speakerName = (nameTokens.length ? nameTokens : channelSlug.split('_')).join(' ');
+            if (speakerId) {
+                const speaker = makeGraphQLRequest('SPEAKER_BY_ID', { id: speakerId }, "acmeSpeaker")?.data?.acmeSpeaker;
+                if (speaker) {
+                    speakerName = formatName(speaker.firstname, speaker.lastname);
+                }
+            }
+
+            // Every hit is taken as a candidate rather than matched on name here: display names and
+            // slugs disagree too often (larissa_may is credited "Larz May"). They are verified
+            // against the authoritative speaker slug after enrichment instead.
+            verifyBySpeakerSlug = true;
+            speakerNameTokens = speakerName.toLowerCase().split(/\s+/).filter(Boolean);
+            let totalPages = 1;
+            for (let page = 0; page < Math.min(totalPages, SPEAKER_TALKS_MAX_PAGES); page++) {
+                const searchParams = {
+                    "hitsPerPage": SPEAKER_TALKS_SEARCH_LIMIT,
+                    "page": page,
+                    "query": speakerName
+                };
+                const searchRequest = [{ "indexName": "newest", "params": searchParams }];
+                const searchResponse = makeRequestWithRetry('POST', PLATFORM.SEARCH_URL, JSON.stringify(searchRequest), DEFAULT_HEADERS, { throwOnError: false });
+                if (!searchResponse.isOk) {
+                    break;
+                }
+
+                const searchResults = safeJsonParse(searchResponse.body)?.results?.[0];
+                totalPages = searchResults?.nbPages || 1;
+                talkSlugs = talkSlugs.concat((searchResults?.hits || []).map(hit => hit?.slug).filter(Boolean));
+            }
         }
 
-        // Extract talk slugs from the page
-        const talkSlugs = extractTalkSlugsFromHtml(response.body);
-        if (!talkSlugs || talkSlugs.length === 0) {
+        if (!talkSlugs.length) {
             trace('Speaker does not have any talks yet.');
             return createEmptyPager();
         }
@@ -1013,8 +1087,30 @@ function getChannelContentsByUrl(url) {
             return createEmptyPager();
         }
 
+        // Search candidates are unverified, so drop any talk this speaker is not credited on. Match
+        // the canonical speaker slug, or the display name when the url slug is itself an alias
+        // (jen_golbeck resolves to the canonical jennifer_golbeck). The page path needs no check.
+        const candidates = verifyBySpeakerSlug
+            ? Object.values(extraMetadata).filter(video => {
+                // Some talks name a contributor only in their slug, not in the speakers list
+                // (pazit_cahlon_and_alex_gendler_... credits Pazit Cahlon alone).
+                if ((video?.slug || '').includes(channelSlug)) {
+                    return true;
+                }
+                return (video?.speakers?.nodes || []).some(speaker => {
+                    if (speaker?.slug === channelSlug) {
+                        return true;
+                    }
+                    const speakerTokens = formatName(speaker?.firstname, speaker?.lastname).toLowerCase().split(/\s+/).filter(Boolean);
+                    return speakerTokens.length > 0
+                        && (speakerNameTokens.every(token => speakerTokens.includes(token))
+                            || speakerTokens.every(token => speakerNameTokens.includes(token)));
+                });
+            })
+            : Object.values(extraMetadata);
+
         // Process videos and sort by date, filtering out podcast-only content (unless external content handling is "Show")
-        const videos = Object.values(extraMetadata)
+        const videos = candidates
             .filter(video => shouldShowContent(video, {}))
             .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
             .map(video => {
@@ -1140,8 +1236,8 @@ function getVideoDetailsByUrl(url) {
     try {
         const slug = extractTedSlug(url);
         if (!slug) {
-            trace(`Could not extract TED talk slug from URL: ${url}`);
-            return null;
+            // Returning null here would surface as an engine cast error rather than a clean message
+            throw new UnavailableException("This does not look like a TED talk link.");
         }
 
         const responseBody = makeGraphQLRequest(
@@ -1150,9 +1246,14 @@ function getVideoDetailsByUrl(url) {
             "shareLinks"
         );
 
+        // A null body means the request itself failed, which is transient and must not be reported
+        // as a missing talk. Only a successful-but-empty result means the talk is really gone.
+        if (!responseBody) {
+            throw new ScriptException('Could not reach TED to load this talk.');
+        }
+
         if (!responseBody?.data?.videos?.nodes || responseBody.data.videos.nodes.length === 0) {
-            trace(`No video data found for slug: ${slug}`);
-            return null;
+            throw new UnavailableException('This talk could not be found. It may have been removed.');
         }
 
         const video = responseBody.data.videos.nodes[0];
@@ -1213,7 +1314,8 @@ function getVideoDetailsByUrl(url) {
             throw error;
         }
 
-        return null;
+        // The caller is source.getContentDetails, whose result must be an object
+        throw new ScriptException(`Could not load this talk: ${error.message}`);
     }
 }
 
@@ -1260,29 +1362,32 @@ function makeGraphQLRequest(queryName, variables, operationName) {
  */
 function getVideoDetailsBySlugList(slugs) {
     try {
-        const query = {
-            query: GQL_QUERIES.VIDEOS_INFO_BY_SLUG,
-            variables: {
-                slug: slugs
+        const detailsBySlug = {};
+
+        // The query caps results at VIDEO_DETAILS_BATCH_SIZE, so longer lists are sent in batches
+        // rather than silently losing everything past the cap.
+        for (let offset = 0; offset < slugs.length; offset += VIDEO_DETAILS_BATCH_SIZE) {
+            const query = {
+                query: GQL_QUERIES.VIDEOS_INFO_BY_SLUG,
+                variables: {
+                    slug: slugs.slice(offset, offset + VIDEO_DETAILS_BATCH_SIZE)
+                }
+            };
+
+            const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { throwOnError: false });
+            if (!response.isOk) {
+                continue;
             }
-        };
 
-        const response = makeRequestWithRetry('POST', PLATFORM.GRAPHQL_URL, JSON.stringify(query), DEFAULT_HEADERS, { throwOnError: false });
-
-        if (!response.isOk) {
-            return {};
+            const videos = safeJsonParse(response.body)?.data?.videos?.nodes || [];
+            videos.forEach(video => {
+                if (video.slug) {
+                    detailsBySlug[video.slug] = video;
+                }
+            });
         }
 
-        const data = safeJsonParse(response.body);
-        const videos = data?.data?.videos?.nodes || [];
-        
-        // Convert array to map keyed by slug
-        return videos.reduce((acc, video) => {
-            if (video.slug) {
-                acc[video.slug] = video;
-            }
-            return acc;
-        }, {});
+        return detailsBySlug;
     } catch (error) {
         trace(`Exception in getVideoDetailsBySlugList: ${error.message}`);
         return {};
@@ -1404,6 +1509,18 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
 
                 lastResponse = response;
                 trace(`[${label}] ${method} ${url} failed with status ${response.code}. Attempts left: ${attempts - 1}`);
+
+                // Most client errors are deterministic, so repeating them only wastes requests.
+                // Timeouts, early-data rejections and rate limits can still succeed on another try.
+                if (response.code >= 400 && response.code < 500) {
+                    if (!HTTP_RETRYABLE_CLIENT_ERRORS.includes(response.code)) {
+                        return { lastResponse, lastError };
+                    }
+                    // Only pace a rate limit, and only when a further attempt actually follows
+                    if (response.code === HTTP_TOO_MANY_REQUESTS && attempts > 1) {
+                        bridge.sleep(HTTP_RETRY_BASE_DELAY_MS * (maxRetries + 2 - attempts));
+                    }
+                }
             } catch (error) {
                 lastError = error;
                 trace(`[${label}] Exception in ${method} ${url}: ${error.message}. Attempts left: ${attempts - 1}`);
@@ -1419,8 +1536,13 @@ function makeRequestWithRetry(method, url, body = null, headers = {}, options = 
         return httpResult;
     }
 
-    // 2. Try httpimp if available (single attempt)
-    if (useImp) {
+    // 2. Try httpimp if available (single attempt). A deterministic client error will not change
+    // with a different TLS fingerprint, so only escalate on 403, which is how bot blocking presents.
+    const httpCode = httpResult.lastResponse?.code;
+    const isTerminalClientError = httpCode >= 400 && httpCode < 500
+        && httpCode !== HTTP_FORBIDDEN
+        && !HTTP_RETRYABLE_CLIENT_ERRORS.includes(httpCode);
+    if (useImp && !isTerminalClientError) {
         const impResult = tryClient(httpimp, 'httpimp', 1, impHeaders);
         if (impResult.isOk !== undefined) {
             return impResult;
